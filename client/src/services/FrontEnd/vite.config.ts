@@ -7,7 +7,6 @@ import react from "@vitejs/plugin-react-swc";
 import svgr from "vite-plugin-svgr";
 import commonjs from '@rollup/plugin-commonjs';
 import { VitePWA } from 'vite-plugin-pwa';
-import { visualizer } from 'rollup-plugin-visualizer';
 
 import tsconfigPaths from "vite-tsconfig-paths";
 
@@ -122,7 +121,7 @@ function coepHeadersPlugin(): Plugin {
 }
 
 // https://vite.dev/config/
-export default defineConfig({
+export default defineConfig(async () => ({
   base: "/",
   define: {
     global: 'globalThis',
@@ -245,7 +244,7 @@ export default defineConfig({
     // runs in a normal `npm run build`. Emits dist/bundle-stats.html.
     //   ANALYZE=1 npm run build && open dist/bundle-stats.html
     ...(process.env.ANALYZE
-      ? [visualizer({
+      ? [(await import('rollup-plugin-visualizer')).visualizer({
           filename: 'dist/bundle-stats.html',
           template: 'treemap',
           gzipSize: true,
@@ -333,4 +332,4 @@ export default defineConfig({
       '**/src/services/identity/passkey.test.ts',
     ],
   },
-});
+}));
