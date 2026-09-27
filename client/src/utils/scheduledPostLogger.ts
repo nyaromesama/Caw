@@ -77,6 +77,10 @@ class ScheduledPostLogger {
     if (this.logStream) {
       this.logStream.end()
       this.logStream = null
+      // Let the next line reopen the file. Without this, rollover() sees the
+      // same date and skips, so anything logged after close() on that day was
+      // dropped.
+      this.logDate = ''
     }
   }
 }
