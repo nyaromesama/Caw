@@ -7,6 +7,7 @@ import { getBlockedUserIds } from '../shared/blockUtils'
 import { safeDecrement } from '../../services/CountManager'
 import rateLimit from 'express-rate-limit'
 import { detectLanguage } from './translate'
+import { parsePoll } from '../../tools/pollMarker'
 
 const router = Router()
 
@@ -987,11 +988,19 @@ router.post('/:id/source-language', sourceLanguageRateLimit, async (req, res) =>
       return res.json({ persisted: false })
     }
 
+    // Same text the FE sends to /api/translate: a poll's wire marker
+    // (::poll:a:b::pd:1d::) is not language and skews detection, so replace
+    // it with the options on their own lines.
+    const poll = parsePoll(caw.content)
+    const detectText = poll
+      ? `${(caw.content.slice(0, poll.start) + caw.content.slice(poll.end)).trim()}\n\n${poll.options.join('\n')}`.trim()
+      : caw.content
+
     sourceLanguageInFlight.add(id)
     res.status(202).json({ persisted: false, detecting: true })
 
     try {
-      const lang = await detectLanguage(caw.content)
+      const lang = await detectLanguage(detectText)
       if (lang) {
         sourceLanguageFailedAt.delete(id)
         await prisma.caw.updateMany({
