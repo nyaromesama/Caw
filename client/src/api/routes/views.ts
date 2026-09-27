@@ -1,6 +1,8 @@
 import { Router } from 'express'
 import { trackView, trackBulkViews, getTrendingByViews } from '../../services/ViewTracker'
 import crypto from 'crypto'
+import type { Request } from 'express'
+import { extractSession } from '../middleware/auth'
 
 const router = Router()
 
@@ -12,13 +14,29 @@ function hashIP(ip: string): string {
 }
 
 /**
+ * The viewer's tokenId for de-duplication, only when the request's session is
+ * authorized for it. x-user-id alone is a client-supplied header: trusting it
+ * let one client count as a different viewer on every request, so views (and
+ * the trending list built from them) could be inflated without limit, and the
+ * per-caw viewer set grew with every made-up id. Without a matching session the
+ * view is keyed by IP hash, as for a signed-out viewer.
+ */
+async function authorizedViewerId(req: Request): Promise<number | undefined> {
+  const raw = req.header('x-user-id')
+  if (!raw || !/^[0-9]+$/.test(raw)) return undefined
+  const claimed = Number(raw)
+  if (req.sessionData === undefined) await extractSession(req)
+  return req.sessionData?.authorizedTokenIds.includes(claimed) ? claimed : undefined
+}
+
+/**
  * POST /api/views/track
  * Track a single view for a caw
  */
 router.post('/track', async (req, res) => {
   try {
     const { cawId } = req.body
-    const userId = req.header('x-user-id') ? Number(req.header('x-user-id')) : undefined
+    const userId = await authorizedViewerId(req)
     const ip = req.ip || req.socket.remoteAddress || 'unknown'
     const ipHash = hashIP(ip)
 
@@ -47,7 +65,7 @@ router.post('/track', async (req, res) => {
 router.post('/track-bulk', async (req, res) => {
   try {
     const { cawIds } = req.body
-    const userId = req.header('x-user-id') ? Number(req.header('x-user-id')) : undefined
+    const userId = await authorizedViewerId(req)
     const ip = req.ip || req.socket.remoteAddress || 'unknown'
     const ipHash = hashIP(ip)
 
