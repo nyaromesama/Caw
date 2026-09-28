@@ -259,15 +259,18 @@ let _capStateBlock = -1n
  *
  * Reads at the END of the block (same convention as verifyMultiplier). An
  * oracle push landing later in the same block than the action is the one
- * case this does not cover. Non-archive RPC: falls back to HEAD, which is
- * still at least as fresh as the previous sample. On any read failure the
- * previous sample is kept (today's behaviour). Called outside any DB
- * transaction — RPC reads must not extend a Prisma tx.
+ * case this does not cover. The historical read is retried once; if it still
+ * fails (a transient error, or an RPC that serves no history) the previous
+ * sample is kept, as before this change. There is no fallback to HEAD: for
+ * an older block HEAD can be wrong in either direction (a push after the
+ * block makes a sample that was stale at the block look fresh), so it is not
+ * safer than the previous sample. Called outside any DB transaction — RPC
+ * reads must not extend a Prisma tx.
  */
 export async function refreshCapStateAtBlock(blockNumber: bigint): Promise<void> {
   const s = await ensureBooted()
   if (s.halted || blockNumber === _capStateBlock) return
-  const cs = (await fetchCapState(Number(blockNumber))) ?? (await fetchCapState())
+  const cs = (await fetchCapState(Number(blockNumber))) ?? (await fetchCapState(Number(blockNumber)))
   if (!cs) return
   _capStateBlock = blockNumber
   const changed = cs.ratio !== s.capRatio || cs.lastUpdatedAt !== s.capLastUpdatedAt
