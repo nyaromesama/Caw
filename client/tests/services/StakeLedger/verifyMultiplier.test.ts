@@ -377,11 +377,22 @@ describe('StakeLedger / verifyMultiplierAtBoot', () => {
     expect(cap.logs.some(l => l.includes('DIVERGENCE at boot') && l.includes('block 47361280'))).to.equal(true)
   })
 
-  it('does not halt when the multiplier matches at lastBlock', async () => {
+  it('does not halt, and logs one ok line, when the multiplier matches at lastBlock', async () => {
     const s = makeState({ multiplier: PRECISION + 5n, lastBlock: 9n })
     _setContractForTests(mockContract({ blockTagValue: PRECISION + 5n }))
-    await verifyMultiplierAtBoot(s)
+    const logs: string[] = []
+    const orig = console.log
+    console.log = (...args: any[]) => { logs.push(args.join(' ')) }
+    try {
+      await verifyMultiplierAtBoot(s)
+    } finally {
+      console.log = orig
+    }
     expect(s.halted).to.equal(false)
+    const ok = logs.filter(l => l.includes('boot multiplier check ok'))
+    expect(ok.length).to.equal(1)
+    expect(ok[0]).to.include('block 9')
+    expect(ok[0]).to.include((PRECISION + 5n).toString())
   })
 
   it('reads at the persisted lastBlock, never HEAD', async () => {

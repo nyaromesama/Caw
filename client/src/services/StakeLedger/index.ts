@@ -875,6 +875,8 @@ export async function verifyMultiplierAtBoot(s: RuntimeState): Promise<void> {
         `Halting writes — operator must reseed (read CawProfileLedger state and overwrite StakeLedgerState + CawOwnershipCurrent).`,
     )
     s.halted = true
+  } else {
+    console.log(`[StakeLedger] boot multiplier check ok at block ${lastBlock} (multiplier=${onChain})`)
   }
 }
 
