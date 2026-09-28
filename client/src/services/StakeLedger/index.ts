@@ -395,15 +395,22 @@ export async function recordAction(
   // fast path (no recipients, no explicit tip) still moves CAW from the
   // sender to the validator:
   //   - session-key actions pay an implicit tip, min(networkTipCAW,
-  //     session.perActionTipRate), credited to validatorId once per batch;
+  //     session.perActionTipRate), credited to validatorId once per batch.
+  //     networkTipCAW is 0 while the tip oracle is dormant or its sample is
+  //     older than 24h, and the tip is then the full perActionTipRate, so
+  //     the per-action amount changes whenever the oracle goes stale or is
+  //     refreshed;
   //   - OTHER actions with no tip mechanism firing pay a _getCost(1000, 1e11)
   //     floor to validatorId.
   // Neither amount is in the ActionsProcessed event, and whether an action
-  // was session-signed isn't in rawAction, so the ledger skips both. Both
-  // carry 0 communal, so rewardMultiplier (and verifyMultiplier) is
-  // unaffected; the drift is per-user: the sender is over-counted, the
-  // validator under-counted. StakeLedgerReconciler reports the sender side
-  // as MISMATCH every day.
+  // was session-signed isn't in rawAction, so the ledger skips both: the
+  // sender is over-counted, the validator under-counted. Both carry 0
+  // communal, but the drift does not stay per-user. A distribution's
+  // multiplier step divides by (totalCaw - sender balance), so the
+  // over-counted sender's next distributing action moves the ledger's
+  // multiplier off the chain's, and verifyMultiplier halts.
+  // StakeLedgerReconciler reports the sender as MISMATCH on the runs that
+  // check them (users with a snapshot in the last 24h).
 
   // OTHER:tip — sender pays the recipient + validator tip via step 2;
   // we re-tag the spend rows below with reason=ACTION_SPEND_TIP so the
