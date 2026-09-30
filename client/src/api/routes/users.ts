@@ -179,7 +179,7 @@ router.post('/ensure', async (req, res) => {
  * Frontend uses this to combine three previously-separate polls into one.
  * IMPORTANT: This route must be defined BEFORE /:username to avoid conflicts.
  */
-router.get('/badges', requireAuth({ lookup: async (req) => tokenIdParam(req.query.userId) }), async (req, res) => {
+router.get('/badges', requireAuth({ lookup: async (req) => tokenIdParam(req.query.userId), verifyOwnership: true }), async (req, res) => {
   try {
     const userId = parseInt(req.query.userId as string)
     if (!userId || isNaN(userId)) {

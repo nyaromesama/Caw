@@ -9,7 +9,7 @@ const router = Router()
  * GET /api/scheduled
  * Get scheduled caws for the authenticated user
  */
-router.get('/', requireAuth({ lookup: (req) => Promise.resolve(tokenIdParam(req.header('x-user-id'))) }), async (req, res) => {
+router.get('/', requireAuth({ lookup: (req) => Promise.resolve(tokenIdParam(req.header('x-user-id'))), verifyOwnership: true }), async (req, res) => {
   try {
     const userId = req.header('x-user-id') ? parseInt(req.header('x-user-id')!) : null
 
