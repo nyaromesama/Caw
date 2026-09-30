@@ -296,9 +296,13 @@ const FeedItem: React.FC<{ item: CawItem; isMainPost?: boolean; isReply?: boolea
   const effectiveReplyAdj = settled(replyCountAdj, useItem.commentCount, replyCountBase) ? 0 : replyCountAdj
   const effectiveRecawAdj = settled(recawCountAdj, useItem.recawCount, recawCountBase) ? 0 : recawCountAdj
   // Override wins until the server agrees with it (same rule as likeOverride).
-  const recawOverrideActive = recawOverride !== null && recawOverride !== !!useItem.hasRecawed
-  const recawShownSettled = recawOverrideActive ? !!recawOverride : !!(useItem.hasRecawed || isRecawByCurrentUser)
-  const recawShown = recawOverrideActive ? !!recawOverride : !!(useItem.hasRecawed || isRecawByCurrentUser || recawPending)
+  // Compare against the combined state: on a pure repost row authored by the
+  // viewer, isRecawByCurrentUser stays true after an undo, so comparing with
+  // hasRecawed alone would drop the override and show "Undo repost" again.
+  const serverHasRecawed = !!(useItem.hasRecawed || isRecawByCurrentUser)
+  const recawOverrideActive = recawOverride !== null && recawOverride !== serverHasRecawed
+  const recawShownSettled = recawOverrideActive ? !!recawOverride : serverHasRecawed
+  const recawShown = recawOverrideActive ? !!recawOverride : !!(serverHasRecawed || recawPending)
   const effectiveLikeAdj  = settled(likeCountAdj,  useItem.likeCount,    likeCountBase)  ? 0 : likeCountAdj
   const effectiveTipAdj   = settled(tipCountAdj, useItem.tipCount ?? 0, tipCountBase)    ? 0 : tipCountAdj
 
