@@ -760,7 +760,7 @@ const AccountSettings: React.FC = () => {
     window.location.reload()
   }
 
-  const handleLogoutCurrentAccount = () => {
+  const handleLogoutCurrentAccount = async () => {
     if (!activeTokenId) return
     // Clear DM keys for this account only
     clearKeyCache(activeTokenId)
@@ -782,6 +782,18 @@ const AccountSettings: React.FC = () => {
     try { usePinnedProfilesStore.getState().unpin(activeTokenId) } catch { /* best-effort */ }
     // Remove this token from the profile chooser and deactivate it
     useTokenDataStore.getState().removeToken(activeTokenId)
+    // Sign this owner out of the server session too. Without it the cookie
+    // keeps the session, and the reload below rebuilds authorizedTokenIds from
+    // it. Best-effort: a network error still clears local state.
+    if (ownerLc) {
+      try {
+        await apiFetch('/api/auth/logout-address', {
+          method: 'POST',
+          body: JSON.stringify({ address: ownerLc }),
+          skipAuthModal: true,
+        })
+      } catch { /* best-effort */ }
+    }
     // Clear auth session
     useAuthStore.getState().clearSession()
     setShowLogoutModal(false)
