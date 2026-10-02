@@ -595,6 +595,7 @@ export async function syncTokensOwnedByWallet(walletAddress: string): Promise<nu
       } else if (user.address.toLowerCase() !== normalized) {
         console.log(`[UserService] Ownership changed for tokenId=${tokenId}: ${user.address} → ${normalized}`)
         await prisma.user.update({ where: { tokenId }, data: { address: normalized } })
+        await settleTentativeDmIdentity(tokenId, normalized, 'UserService')
       }
     }
 

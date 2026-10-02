@@ -7,7 +7,8 @@ import { prisma } from '../../prismaClient'
  * POST /api/dm/identity/relay accepts a key without checking the wallet when
  * the local User row has no address yet, and records the relayed wallet in
  * `relayedWalletAddress`. Once the owner is known:
- * - relayed wallet == owner: the row is confirmed; the marker is cleared.
+ * - relayed wallet == owner: the row is confirmed; the marker is cleared
+ *   (only while it still names that wallet, like the other two branches).
  * - relayed wallet != owner, and the row still holds the key registered for
  *   that wallet: the key is cleared (publicKey '' = no key, the same
  *   placeholder ensureDmIdentity and clearStaleDmKeys use) and the row is
@@ -18,7 +19,9 @@ import { prisma } from '../../prismaClient'
  *   key is not the relayed one; only the stale marker is cleared.
  *
  * Call it wherever User.address gets written from chain: the Transfer
- * watcher and refreshUserFromChain (placeholder rows created by DM relay).
+ * watcher, refreshUserFromChain (placeholder rows created by DM relay), and
+ * syncTokensOwnedByWallet (not imported anywhere today; settled there so a
+ * future caller does not skip it).
  *
  * Non-fatal: failures log but do not surface to the caller.
  *
@@ -35,8 +38,8 @@ export async function settleTentativeDmIdentity(tokenId: number, ownerAddress: s
     const owner = ownerAddress.toLowerCase()
 
     if (relayed === owner) {
-      await prisma.dmIdentity.update({
-        where: { userId: tokenId },
+      await prisma.dmIdentity.updateMany({
+        where: { userId: tokenId, relayedWalletAddress: identity.relayedWalletAddress },
         data: { relayedWalletAddress: null },
       })
       return
