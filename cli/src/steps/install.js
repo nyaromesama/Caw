@@ -479,12 +479,20 @@ export async function startServices(nodeType, installDir) {
   // directive), and those apps need to write to logs/ and read from .env.
   // Chown the install dir to caw:caw so the running services have access.
   // Skip when not running as root (dev / non-sudo invocation).
-  const runAsUser = process.env.SUDO_USER
+  //
+  // Resolve the user the same way generate.js's buildPm2Config() does, so the
+  // chown target always matches the ecosystem's `user:`. install.sh passes
+  // SUDO_USER=caw, but a root re-run of `caw install` (which this CLI's own
+  // error messages suggest) has no SUDO_USER. Without this fallback the
+  // ecosystem still says `user: caw` while .env (mode 600) stays root-owned,
+  // so the API can't read .env and crash-loops on "NETWORK_ID is required".
+  const isRoot = process.getuid && process.getuid() === 0
+  const runAsUser = process.env.SUDO_USER || (isRoot ? 'caw' : null)
   if (runAsUser) assertSafeUsername(runAsUser)
   // Non-null only when this install actually hands installDir to an
   // unprivileged user. Anything root runs out of that tree afterwards has to
   // drop to this user, or the boundary the chown creates isn't real.
-  const treeOwner = runAsUser && process.getuid && process.getuid() === 0 ? runAsUser : null
+  const treeOwner = runAsUser && isRoot ? runAsUser : null
   if (treeOwner) {
     const spinner0 = ora(`Chowning ${installDir} to ${runAsUser}...`).start()
     try {
