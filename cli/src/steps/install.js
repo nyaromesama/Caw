@@ -120,14 +120,16 @@ export async function runInstall(nodeType, config, installDir) {
   // via sudo, SUDO_USER carries the original unprivileged user; drop to
   // that user for the build step only, via the same
   // 'sudo -u X -H env ... cmd' pattern update.js's runAsInstallUser()
-  // already uses for its own build/migrate steps. No-ops (falls back to
-  // running as the current user) when SUDO_USER is unset — dev-mode /
-  // non-sudo invocations are unaffected.
+  // already uses for its own build/migrate steps. Running as root without
+  // SUDO_USER (a root re-run of `caw install`) builds as 'caw', the same
+  // fallback startServices() and buildPm2Config() use; otherwise dist/ is
+  // left root-owned. Non-root invocations (dev mode) still build as the
+  // current user.
   // $SUDO_USER — validate it's a real username before it's used in any
   // privileged chown / sudo call below (defense-in-depth vs a spoofed value).
-  const buildAsUser = process.env.SUDO_USER || null
-  if (buildAsUser) assertSafeUsername(buildAsUser)
   const isRoot = process.getuid && process.getuid() === 0
+  const buildAsUser = process.env.SUDO_USER || (isRoot ? 'caw' : null)
+  if (buildAsUser) assertSafeUsername(buildAsUser)
 
   // Create logs directory
   fs.mkdirSync(path.join(installDir, 'logs'), { recursive: true })
