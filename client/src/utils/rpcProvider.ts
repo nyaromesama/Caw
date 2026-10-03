@@ -114,7 +114,10 @@ export async function waitForRateLimit(): Promise<void> {
 export function isRateLimitError(err: any): boolean {
   const msg = (err?.message || err?.reason || '').toLowerCase()
   const code = err?.error?.code || err?.code
-  return code === -32005 || msg.includes('too many requests') || msg.includes('429') || msg.includes('rate limit')
+  // '429' has to stand alone. RPC error messages often embed the request /
+  // response JSON (topics, hashes, block numbers), and a plain substring match
+  // fires on any of those that happens to contain the digits 429.
+  return code === -32005 || msg.includes('too many requests') || /(^|[^0-9a-z])429([^0-9a-z]|$)/.test(msg) || msg.includes('rate limit')
 }
 
 // ============================================
