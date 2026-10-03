@@ -783,8 +783,9 @@ async function collectSentryDsn(nodeType) {
     `  ${brand('4.')} Paste below.`,
     '',
     'Leave blank to skip — error handling falls back to plain console logs',
-    'and pm2 log files. You can add SENTRY_DSN / VITE_SENTRY_DSN to the env',
-    'files later without re-running install.',
+    'and pm2 log files. You can add SENTRY_DSN to client/.env later without',
+    're-running install. VITE_SENTRY_DSN (frontend errors) also needs a',
+    'frontend rebuild, since it is baked in at build time.',
   ])
 
   const { dsn } = await inquirer.prompt([
