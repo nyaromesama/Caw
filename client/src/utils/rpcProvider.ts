@@ -470,12 +470,15 @@ function buildAuthenticatedFetchRequest(url: string, explicitSecret?: string): F
  * The warning message explicitly tells the operator to check L*_RPC_URL_HTTP
  * so they can act on it without grepping source code.
  */
-async function verifyChainId(provider: { getNetwork(): Promise<{ chainId: bigint } > }, expectedChainId: number, url: string): Promise<void> {
+async function verifyChainId(provider: { send(method: string, params: any[]): Promise<any> }, expectedChainId: number, url: string): Promise<void> {
   const PROBE_TIMEOUT_MS = 10_000
-  let net: { chainId: bigint }
+  let raw: unknown
   try {
-    net = await Promise.race([
-      provider.getNetwork(),
+    raw = await Promise.race([
+      // Ask the RPC itself. Every caller builds the provider with the expected
+      // chainId as staticNetwork, so getNetwork() would return that value
+      // without a round-trip and this check could never fail.
+      provider.send('eth_chainId', []),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('probe timeout')), PROBE_TIMEOUT_MS)
       ),
@@ -489,7 +492,7 @@ async function verifyChainId(provider: { getNetwork(): Promise<{ chainId: bigint
     )
     return
   }
-  const actual = Number(net.chainId)
+  const actual = Number(BigInt(raw as string))
   if (actual !== expectedChainId) {
     throw new Error(
       `ChainIdMismatchError: expected ${expectedChainId} got ${actual} on ${redactRpcUrl(url)}. ` +
@@ -612,7 +615,8 @@ export function makeWebSocketProvider(url: string, chainId?: number, secret?: st
 // VERIFIED PROVIDER FACTORIES
 // ============================================
 // These wrappers call makeJsonRpcProvider / makeFallbackJsonRpcProvider /
-// makeWebSocketProvider and then probe the RPC once via getNetwork() to
+// makeWebSocketProvider and then probe the RPC once via a raw eth_chainId
+// call (not getNetwork(), which just echoes the staticNetwork we pass in) to
 // assert the returned chainId matches the expected value. Protects indexers
 // against DNS hijack / BGP poisoning / misconfigured RPC URLs that could
 // route them to the wrong chain and produce slashable submissions.
