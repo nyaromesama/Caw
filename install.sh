@@ -152,8 +152,11 @@ if [[ $EUID -ne 0 ]]; then
   # The README one-liner runs us as `bash -c "<script>"`. In that mode $0 is
   # the shell itself (/bin/bash), not a script file, so `bash "$0"` would try
   # to execute the bash binary as a script ("cannot execute binary file").
-  # BASH_EXECUTION_STRING holds the -c text; re-exec that instead.
-  if [[ -n "${BASH_EXECUTION_STRING:-}" ]]; then
+  # BASH_EXECUTION_STRING holds the -c text; re-exec that instead. Only in
+  # -c mode: when the script runs from a file, bash leaves an inherited
+  # BASH_EXECUTION_STRING from the environment visible, and re-exec'ing that
+  # under sudo would run arbitrary text as root instead of this script.
+  if [[ $- == *c* && -n "${BASH_EXECUTION_STRING:-}" ]]; then
     exec sudo -E bash -c "$BASH_EXECUTION_STRING" "$0" "$@"
   fi
   exec sudo -E bash "$0" "$@"
