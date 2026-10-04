@@ -472,9 +472,9 @@ function buildAuthenticatedFetchRequest(url: string, explicitSecret?: string): F
  */
 async function verifyChainId(provider: { send(method: string, params: any[]): Promise<any> }, expectedChainId: number, url: string): Promise<void> {
   const PROBE_TIMEOUT_MS = 10_000
-  let raw: unknown
+  let actual: number
   try {
-    raw = await Promise.race([
+    const raw = await Promise.race([
       // Ask the RPC itself. Every caller builds the provider with the expected
       // chainId as staticNetwork, so getNetwork() would return that value
       // without a round-trip and this check could never fail.
@@ -483,6 +483,9 @@ async function verifyChainId(provider: { send(method: string, params: any[]): Pr
         setTimeout(() => reject(new Error('probe timeout')), PROBE_TIMEOUT_MS)
       ),
     ])
+    // Parse inside the try: a malformed reply (e.g. null) is an unusable
+    // probe, not a confirmed mismatch.
+    actual = Number(BigInt(raw as string))
   } catch (e: any) {
     console.warn(
       `[rpcProvider] chain-ID probe failed for ${redactRpcUrl(url)} — ` +
@@ -492,7 +495,6 @@ async function verifyChainId(provider: { send(method: string, params: any[]): Pr
     )
     return
   }
-  const actual = Number(BigInt(raw as string))
   if (actual !== expectedChainId) {
     throw new Error(
       `ChainIdMismatchError: expected ${expectedChainId} got ${actual} on ${redactRpcUrl(url)}. ` +
@@ -747,10 +749,13 @@ export function makeResilientHttpProvider(
     rebuilding = true
     console.warn(`[rpcProvider] resilient(${label}) rebuilding after connection error: ${reason}`)
     const candidate = makeFallbackJsonRpcProvider(urls, chainId)
-    // Probe the CANDIDATE's chainId before promoting it. verifyChainId throws
-    // ONLY on a confirmed mismatch; a probe timeout / transient failure resolves
-    // (warns) so we still promote a slow-but-alive RPC.
-    verifyChainId(candidate as any, chainId, urls[0])
+    // Probe the primary URL's chainId before promoting the candidate.
+    // verifyChainId throws ONLY on a confirmed mismatch; a probe timeout /
+    // transient failure resolves (warns) so we still promote a slow-but-alive
+    // RPC. With two or more URLs the candidate is an ethers FallbackProvider,
+    // which has no send(), so probe a plain provider on urls[0] instead (same
+    // as makeVerifiedFallbackJsonRpcProvider).
+    verifyChainId(makeJsonRpcProvider(urls[0], chainId), chainId, urls[0])
       .then(() => {
         // Verified (or tolerated timeout) — promote, retiring the old provider.
         const old = current
