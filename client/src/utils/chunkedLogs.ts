@@ -2,7 +2,8 @@
 //
 // RPCs cap the block range of a single eth_getLogs call, and the caps vary
 // widely: paid tiers are around 10K-100K, while sepolia.base.org rejects
-// anything wider than 1,000 (HTTP 413, measured 2026-09). We chunk, and
+// anything wider than 500 (HTTP 413, measured 2026-10-07; it was 2,000,
+// then 1,000 in 2026-09). We chunk, and
 // shrink the chunk when a call fails, so the same code path works against
 // any backend without operator-tuned block ranges.
 //
@@ -28,7 +29,7 @@ import { AbstractProvider, Log } from 'ethers'
 export interface ChunkedScanOptions {
   /** Block range per request. Default: 10_000. The forward scan shrinks
    *  the window when a call fails, so an RPC with a smaller cap
-   *  (sepolia.base.org: 1,000) still works; setting this to the cap just
+   *  (sepolia.base.org: 500) still works; setting this to the cap just
    *  skips the failed attempts. */
   chunkBlocks?: number
   /** Hard ceiling on the number of windows we'll iterate. Defaults are
@@ -74,7 +75,7 @@ export interface BackwardScanOptions extends ChunkedScanOptions {
 const DEFAULT_CHUNK = 10_000
 const DEFAULT_MAX_WINDOWS_FORWARD = 100
 const DEFAULT_MAX_WINDOWS_BACKWARD = 20
-// 10_000 -> 5_000 -> ... -> 312: enough to reach a 1,000-block cap from the
+// 10_000 -> 5_000 -> ... -> 312: enough to reach a 500-block cap from the
 // default chunk, while bounding a window that fails for any other reason
 // (rate limit, outage) to 1 + MAX_FORWARD_SHRINKS calls before throwing.
 const MAX_FORWARD_SHRINKS = 5
