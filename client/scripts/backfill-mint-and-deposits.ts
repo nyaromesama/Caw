@@ -21,12 +21,24 @@
 // uniquely identifies the mintAndDeposit shape: the NFT mint wouldn't
 // fire on a depositFor call (no new token).
 //
+// Since 4f5c090 mintAndDeposit DOES emit Deposited (CawProfile.sol
+// `mintAndDeposit` → `emit Deposited(..., newId, depositAmount, ...)`),
+// and DepositWatcher / backfill-l1-deposits record that deposit at the
+// Deposited log's (txHash, logIndex). This script keys its rows on the
+// CAW Transfer's logIndex instead, so on a post-4f5c090 deployment the
+// idempotency check below can never see the indexer's row and the same
+// deposit would be written twice. Pass 3 therefore collects every tx
+// that already carries a CawProfile Deposited log and skips it: on a
+// pre-4f5c090 deployment those txs don't exist and nothing changes; on a
+// current deployment every mintAndDeposit is skipped.
+//
 // Why not look at the contract's CAW balance: it includes accrued fees
 // and token-balance dust we'd have to subtract out. Event-pairing is
 // deterministic and tx-by-tx auditable.
 //
 // Idempotent: skips if a (txHash, logIndex, reason='DEPOSIT') row
-// already exists. Safe to re-run.
+// already exists. Safe to re-run. (That check only catches this script's
+// own earlier rows — see pass 3 for rows written by the indexer.)
 //
 // Usage:
 //   npx tsx scripts/backfill-mint-and-deposits.ts                # auto-detect deploy block → head
@@ -62,6 +74,12 @@ const L1_CHAIN_ID = Number(process.env.L1_CHAIN_ID || '11155111')
 // `from` value (zero address = NFT mint).
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
 const ZERO_TOPIC = '0x' + '00'.repeat(32)
+
+// Same declaration DepositWatcher and backfill-l1-deposits parse with.
+const depositedIface = new ethers.Interface([
+  'event Deposited(uint32 indexed cawClientId, uint32 indexed tokenId, uint256 amount, uint32 indexed lzDestId, address depositor)',
+])
+const DEPOSITED_TOPIC = depositedIface.getEvent('Deposited')!.topicHash
 
 function logProgress(msg: string) {
   console.log(`[mintAndDeposit-backfill] ${msg}`)
@@ -124,7 +142,7 @@ async function main() {
   // Topics = [Transfer, indexed_from=0, ...]. Filtering on indexed_from at
   // the RPC level is a major win — without it we'd download every token
   // transfer ever and discard mint-only matches client-side.
-  logProgress('pass 1/2: scanning CawProfile NFT mints (Transfer from 0x0)…')
+  logProgress('pass 1/3: scanning CawProfile NFT mints (Transfer from 0x0)…')
   const mintLogs = await scanLogsForward(
     provider,
     CAW_NAMES_ADDRESS,
@@ -150,7 +168,7 @@ async function main() {
   // [Transfer, _from (any), indexed_to = cawProfile]. The to-topic
   // restriction means we only pull deposits, not all token movement.
   const cawProfileTopic = '0x' + CAW_NAMES_ADDRESS.toLowerCase().slice(2).padStart(64, '0')
-  logProgress(`pass 2/2: scanning CAW ERC20 Transfers to ${CAW_NAMES_ADDRESS}…`)
+  logProgress(`pass 2/3: scanning CAW ERC20 Transfers to ${CAW_NAMES_ADDRESS}…`)
   const cawLogs = await scanLogsForward(
     provider,
     CAW_ADDRESS,
@@ -165,6 +183,25 @@ async function main() {
   )
   logProgress(`pass 2 found ${cawLogs.length} CAW→CawProfile transfer event(s)`)
 
+  // Pass 3: CawProfile Deposited events (any network). A tx that has one
+  // is already indexable by DepositWatcher / backfill-l1-deposits, at a
+  // different logIndex than the CAW Transfer this script keys on.
+  logProgress('pass 3/3: scanning CawProfile Deposited events…')
+  const depositedLogs = await scanLogsForward(
+    provider,
+    CAW_NAMES_ADDRESS,
+    [DEPOSITED_TOPIC],
+    fromBlock,
+    toBlock,
+    {
+      chunkBlocks: argChunk ?? 10_000,
+      maxWindows: 10_000,
+      onProgress: (a, b, n) => logProgress(`  scanned blocks ${a}..${b} (+${n} Deposited)`),
+    },
+  )
+  const depositedTx = new Set(depositedLogs.map((l) => l.transactionHash))
+  logProgress(`pass 3 found ${depositedLogs.length} Deposited event(s) in ${depositedTx.size} tx(s)`)
+
   // Match: a CAW transfer counts as a mintAndDeposit if its tx ALSO
   // contains an NFT mint. The mint log gives us the (owner, tokenId).
   const erc20Iface = new ethers.Interface([
@@ -175,6 +212,7 @@ async function main() {
   ])
 
   let matched = 0
+  let alreadyEmitted = 0
   let skipped = 0
   let written = 0
   let failed = 0
@@ -184,6 +222,10 @@ async function main() {
     const mintLog = mintByTx.get(cawLog.transactionHash)
     if (!mintLog) continue // depositFor / fee transfers / other → not us
     matched++
+    if (depositedTx.has(cawLog.transactionHash)) {
+      alreadyEmitted++ // post-4f5c090 mintAndDeposit — the indexer owns this deposit
+      continue
+    }
 
     let cawParsed
     let mintParsed
@@ -210,10 +252,11 @@ async function main() {
     const blockNumber = BigInt(cawLog.blockNumber)
 
     try {
-      // Idempotency: deposit-backfill / live indexer / earlier runs of
-      // this script may have already written a row for this exact log
-      // position. The (txHash, logIndex) pair uniquely identifies a log
-      // entry chain-wide.
+      // Idempotency against earlier runs of this script: the
+      // (txHash, logIndex) pair uniquely identifies a log entry
+      // chain-wide. Rows from DepositWatcher / backfill-l1-deposits sit at
+      // the Deposited log's logIndex, not this CAW Transfer's — those txs
+      // were already skipped above via depositedTx.
       const existing = await prisma.cawOwnershipSnapshot.findFirst({
         where: { txHash, logIndex, reason: 'DEPOSIT' },
         select: { id: true },
@@ -256,7 +299,8 @@ async function main() {
 
   const totalCaw = totalAmount / 10n ** 18n
   logProgress(
-    `Done. matched=${matched}, ${dryRun ? 'would-write' : 'wrote'}=${written}, ` +
+    `Done. matched=${matched}, already-emitted=${alreadyEmitted} (Deposited present, skipped), ` +
+    `${dryRun ? 'would-write' : 'wrote'}=${written}, ` +
     `skipped=${skipped} (already-present), failed=${failed}, ` +
     `total deposit volume = ${totalCaw} CAW (${totalAmount} wei).`,
   )
