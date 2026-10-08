@@ -6,7 +6,7 @@ import satori from 'satori'
 import { Resvg } from '@resvg/resvg-js'
 import { prisma } from '../../prismaClient'
 import { publicUrl } from '../util/publicUrl'
-import { isSafePublicUrl } from '../util/ssrfGuard'
+import { safeFetch } from '../util/ssrfGuard'
 import { stripPollMarker } from '../../tools/pollMarker'
 import { t as i18nT } from '../util/i18n'
 import { hasLocale } from '../util/localePrefix'
@@ -226,13 +226,13 @@ const VIDEO_FETCH_BYTES_CAP = 50_000_000  // 50MB; first-frame extraction
 async function fetchBoundedBytes(rawUrl: string, capBytes: number, timeoutMs = 4000): Promise<{ buf: Buffer; contentType: string } | null> {
   const isAbsolute = /^https?:\/\//.test(rawUrl)
   const url = isAbsolute ? rawUrl : `${publicUrl()}${rawUrl.startsWith('/') ? '' : '/'}${rawUrl}`
-  if (isAbsolute && !(await isSafePublicUrl(url))) return null
   try {
     const ctrl = new AbortController()
     const t = setTimeout(() => ctrl.abort(), timeoutMs)
-    const res = await fetch(url, { signal: ctrl.signal })
+    // safeFetch SSRF-checks absolute URLs and every redirect hop.
+    const res = await safeFetch(url, { signal: ctrl.signal }, { trustInitial: !isAbsolute })
     clearTimeout(t)
-    if (!res.ok) return null
+    if (!res || !res.ok) return null
     const cl = Number(res.headers.get('content-length') || 0)
     if (cl > 0 && cl > capBytes) return null
     // Stream-read with a running cap so we don't load oversized bodies
@@ -375,14 +375,14 @@ async function fetchImageDataUri(rawUrl: string): Promise<string | null> {
   const url = isAbsolute
     ? rawUrl
     : `${publicUrl()}${rawUrl.startsWith('/') ? '' : '/'}${rawUrl}`
-  const safe = isAbsolute ? await isSafePublicUrl(url) : RELATIVE_OK.test(rawUrl)
-  if (!safe) return null
+  if (!isAbsolute && !RELATIVE_OK.test(rawUrl)) return null
   try {
     const ctrl = new AbortController()
     const t = setTimeout(() => ctrl.abort(), 4000)
-    const res = await fetch(url, { signal: ctrl.signal })
+    // safeFetch SSRF-checks absolute URLs and every redirect hop.
+    const res = await safeFetch(url, { signal: ctrl.signal }, { trustInitial: !isAbsolute })
     clearTimeout(t)
-    if (!res.ok) return null
+    if (!res || !res.ok) return null
     const ct = (res.headers.get('content-type') || '').toLowerCase()
     if (!ct.startsWith('image/')) return null
     const buf = Buffer.from(await res.arrayBuffer())
