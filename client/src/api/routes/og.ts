@@ -2746,8 +2746,9 @@ async function resolveContentImage(rawUrl: string): Promise<string | null> {
       const row = await prisma.shortUrl.findUnique({ where: { code }, select: { originalUrl: true } })
       // If the short-url row exists locally, resolve to the real
       // destination (avoids one HTTP hop). Otherwise fall through to
-      // letting fetch() follow the 302 — works whenever the
-      // originating CAW node is reachable from this process.
+      // letting safeFetch follow the 302, which SSRF-checks every hop —
+      // works whenever the originating CAW node is reachable from this
+      // process and the redirect target passes that check.
       if (row) return await fetchImageDataUri(row.originalUrl)
     }
   } catch { /* fall through to direct fetch */ }
