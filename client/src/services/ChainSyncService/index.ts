@@ -808,8 +808,10 @@ const L2_EVENT_BOOTSTRAP_LOOKBACK = 10000 // if no cursor exists, start this man
 
 // A failed read must not look like a missing cursor. Returning null here would
 // bootstrap from head - lookback and silently skip every event between the
-// stored cursor and that point. Let it throw: startTask logs the failure and the
-// next tick retries from the stored cursor, the same as a failed getLogs below.
+// stored cursor and that point. Let it throw, like getBlockNumber() right after
+// it: startTask logs the failure and the next tick retries from the stored
+// cursor. Unlike a failed getLogs below (caught there, so the loop still
+// heartbeats), this skips the heartbeat, so a DB that stays down trips the watchdog.
 async function getLastSyncedL2Block(): Promise<number | null> {
   const row = await prisma.chainData.findUnique({ where: { key: L2_SYNC_BLOCK_KEY } })
   const value = row?.value as any
@@ -1070,8 +1072,10 @@ const L1_FEE_EVENT_BOOTSTRAP_LOOKBACK = 50000 // if no cursor, start this many L
 
 // A failed read must not look like a missing cursor. Returning null here would
 // bootstrap from head - lookback and silently skip every event between the
-// stored cursor and that point. Let it throw: startTask logs the failure and the
-// next tick retries from the stored cursor, the same as a failed getLogs below.
+// stored cursor and that point. Let it throw, like getBlockNumber() right after
+// it: startTask logs the failure and the next tick retries from the stored
+// cursor. Unlike a failed getLogs below (caught there, so the loop still
+// heartbeats), this skips the heartbeat, so a DB that stays down trips the watchdog.
 async function getLastSyncedL1FeeBlock(): Promise<number | null> {
   const row = await prisma.chainData.findUnique({ where: { key: L1_FEE_SYNC_BLOCK_KEY } })
   const value = row?.value as any
