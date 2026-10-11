@@ -972,12 +972,14 @@ router.post('/:id/source-language', sourceLanguageRateLimit, async (req, res) =>
   try {
     const id = Number(req.params.id)
     if (!Number.isSafeInteger(id) || id <= 0) {
-      return res.status(400).json({ error: 'Invalid caw id' })
+      res.status(400).json({ error: 'Invalid caw id' })
+      return
     }
 
     const failedAt = sourceLanguageFailedAt.get(id)
     if (sourceLanguageInFlight.has(id) || (failedAt && Date.now() - failedAt < SOURCE_LANGUAGE_RETRY_MS)) {
-      return res.json({ persisted: false })
+      res.json({ persisted: false })
+      return
     }
 
     const caw = await prisma.caw.findFirst({
@@ -985,7 +987,8 @@ router.post('/:id/source-language', sourceLanguageRateLimit, async (req, res) =>
       select: { content: true },
     })
     if (!caw || !caw.content?.trim()) {
-      return res.json({ persisted: false })
+      res.json({ persisted: false })
+      return
     }
 
     // Same text the FE sends to /api/translate: a poll's wire marker
