@@ -487,15 +487,16 @@ router.post('/logout-address', async (req, res) => {
       res.status(400).json({ error: 'address required' })
       return
     }
-    const cookieRe = new RegExp(`(?:^|;\\s*)${SESSION_COOKIE_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=([^;]+)`)
-    const token =
-      (req.headers.cookie?.match(cookieRe)?.[1]) ||
-      (req.headers['x-session-token'] as string | undefined)
-    if (!token) {
+    // Same resolution as requireAuth / refresh: cookie first, and the
+    // x-session-token header when the cookie's session is dead. Nothing to sign
+    // out of without a live session, so answer before touching the DB.
+    await extractSession(req)
+    if (!req.sessionToken || !req.sessionData) {
       res.clearCookie(SESSION_COOKIE_NAME, sessionCookieOptions())
       res.json({ success: true, sessionDeleted: true })
       return
     }
+    const token = req.sessionToken
     const owned = await prisma.user.findMany({
       where: { address: { equals: address, mode: 'insensitive' } },
       select: { tokenId: true },
