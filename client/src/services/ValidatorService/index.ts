@@ -7,7 +7,7 @@ import { prisma }  from '../../prismaClient'
 import getActionType from '../../abi/getActionType'
 import { cawActionsAbi } from '../../abi/generated'
 import { CAW_ACTIONS_ADDRESS, CAW_ACTIONS_ERC1271_ADDRESS, CAW_ADDRESS, WETH_ADDRESS, CAW_ACTIONS_ARCHIVE_ADDRESS, CAW_CHALLENGE_RELAY_ADDRESS } from '../../abi/addresses'
-import { deployments, type Env, type ChainKey } from '../../abi/deployments'
+import { deployments, lzEids, type Env, type ChainKey } from '../../abi/deployments'
 import { WebSocketProvider, JsonRpcProvider, Contract, Interface, keccak256, solidityPacked, AbiCoder } from 'ethers'
 import { packActions, packSignatures, packGroupedSignatures, bytesToHex, getPackedActionSlices, unpackActions, unpackPerActionSigs } from '../../utils/packActions'
 import { buildCheckpointMerkleTree } from '../../utils/checkpointMerkle'
@@ -4326,6 +4326,23 @@ console.log("succeededKeys", succeededKeys)
       return { address, chainId: meta.chainId }
     }
 
+    // LZ eid of the L2 this validator reads actions from — the source chain of
+    // every network it replicates. The archive binds each submission to this
+    // eid and only accepts fraud proofs from that chain's relay. Read the
+    // chainId from the RPC itself: replicationHttpProvider pins its network.
+    let sourceEid: number | null = null
+    async function getSourceEid(): Promise<number> {
+      if (sourceEid !== null) return sourceEid
+      const chainId = Number(await replicationHttpProvider.send('eth_chainId', []))
+      const meta = Object.values(REPLICATION_CHAIN_META).find(m => m.chainId === chainId)
+      const eid = meta ? lzEids[meta.env]?.[meta.chainKey] : undefined
+      if (!eid) {
+        throw new Error(`[OptimisticReplication] no LZ eid for source chainId ${chainId} — add it to REPLICATION_CHAIN_META and lzEids`)
+      }
+      sourceEid = eid
+      return eid
+    }
+
     // Resolved once getL2bContracts() runs. The fallback to the install-time
     // constant is for CLI / debug paths that read OPTIMISTIC_ARCHIVE_ADDRESS
     // before getL2bContracts() has been called — only correct when the
@@ -4358,7 +4375,7 @@ console.log("succeededKeys", succeededKeys)
       'function pendingCount(address) view returns (uint256)',
       'function deposit() payable',
       'function withdraw(uint256)',
-      'function submitReplication(uint32 networkId, uint256 startCheckpointId, uint256 endCheckpointId, bytes packedActions, bytes32[] r, bytes32 merkleRoot, bytes32 entryHash)',
+      'function submitReplication(uint32 networkId, uint256 startCheckpointId, uint256 endCheckpointId, bytes packedActions, bytes32[] r, bytes32 merkleRoot, bytes32 entryHash, uint32 sourceEid)',
       'function finalizeSubmission(uint256 submissionId)',
       'function checkpointClaimed(uint32, uint256) view returns (uint256)',
       'function isRangeAvailable(uint32 networkId, uint256 start, uint256 end) view returns (bool)',
@@ -4377,7 +4394,7 @@ console.log("succeededKeys", succeededKeys)
      * event" path now that the event only carries commitments.
      */
     const archiveSubmitIface = new Interface([
-      'function submitReplication(uint32 networkId, uint256 startCheckpointId, uint256 endCheckpointId, bytes packedActions, bytes32[] r, bytes32 merkleRoot, bytes32 entryHash)',
+      'function submitReplication(uint32 networkId, uint256 startCheckpointId, uint256 endCheckpointId, bytes packedActions, bytes32[] r, bytes32 merkleRoot, bytes32 entryHash, uint32 sourceEid)',
     ])
     async function decodeArchiveSubmissionFromTx(
       provider: { getTransaction: (h: string) => Promise<{ data?: string } | null> },
@@ -5111,12 +5128,13 @@ console.log("succeededKeys", succeededKeys)
 
             // 6. Submit to L2b archive
             const packedHex = bytesToHex(data.packedBytes)
+            const srcEid = await getSourceEid()
 
             // Pre-flight simulation
             try {
               await archiveW.submitReplication.staticCall(
                 client.id, startCheckpointId, endCheckpointId,
-                packedHex, data.allR, merkleRoot, data.entryHash
+                packedHex, data.allR, merkleRoot, data.entryHash, srcEid
               )
             } catch (simErr: any) {
               const reason = simErr?.revert?.args?.[0] || simErr?.reason || simErr?.shortMessage || simErr?.message || 'unknown'
@@ -5129,7 +5147,7 @@ console.log("succeededKeys", succeededKeys)
             try {
               const estimated = await archiveW.submitReplication.estimateGas(
                 client.id, startCheckpointId, endCheckpointId,
-                packedHex, data.allR, merkleRoot, data.entryHash
+                packedHex, data.allR, merkleRoot, data.entryHash, srcEid
               )
               gasLimit = (estimated * 120n) / 100n // 20% buffer for L2b
               if (gasLimit > 30_000_000n) gasLimit = 30_000_000n
@@ -5140,7 +5158,7 @@ console.log("succeededKeys", succeededKeys)
 
             const tx = await archiveW.submitReplication(
               client.id, startCheckpointId, endCheckpointId,
-              packedHex, data.allR, merkleRoot, data.entryHash,
+              packedHex, data.allR, merkleRoot, data.entryHash, srcEid,
               { gasLimit }
             )
             const receipt = await tx.wait()

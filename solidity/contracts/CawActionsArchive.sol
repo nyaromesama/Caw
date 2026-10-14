@@ -128,6 +128,23 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   ///         the Submission struct remain compatible.
   mapping(uint256 => uint256) internal validatorSubmissionsIndexPlusOne;
 
+  /// @notice LZ eid of the source L2 the submitter says this submission's
+  ///         network lives on. Non-existence messages are only accepted from
+  ///         this eid's peer relay. Without the binding, a relay on ANY peered
+  ///         L2 could deliver one: on a chain that doesn't host the network,
+  ///         networkActionCount is 0, so sourceMaxCheckpoint is 0 and every
+  ///         honest submission "over-reaches".
+  ///         A submitter who declares the wrong (peered) eid gains nothing: on
+  ///         that chain the network's count is 0, so a non-existence relay from
+  ///         it slashes them.
+  ///         Challenge hashes are NOT bound to this eid: the relay never sends
+  ///         a zero hash, and only the chain that hosts the network has
+  ///         non-zero checkpoint hashes for it, so they can only come from the
+  ///         real source — even when the submitter declared another eid.
+  ///         Kept out of the Submission struct for the same layout reason as
+  ///         validatorSubmissionsIndexPlusOne.
+  mapping(uint256 => uint32) public submissionSourceEid;
+
   /// @notice networkId => checkpointId => submissionId that covers it
   mapping(uint32 => mapping(uint256 => uint256)) public checkpointClaimed;
 
@@ -274,6 +291,9 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   ///                   value fed into the hash chain as the initial
   ///                   "prev" hash — committing it lets slashIncoherentRoot
   ///                   verify the full fold deterministically.
+  /// @param sourceEid  LZ eid of the L2 that hosts `networkId` (its
+  ///                   storageChainEid). Must have a peer relay here, or no
+  ///                   non-existence proof could ever reach this submission.
   function submitReplication(
     uint32 networkId,
     uint256 startCheckpointId,
@@ -281,9 +301,11 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     bytes calldata packedActions,
     bytes32[] calldata r,
     bytes32 merkleRoot,
-    bytes32 entryHash
+    bytes32 entryHash,
+    uint32 sourceEid
   ) external {
     require(stakes[msg.sender] >= MIN_STAKE, "Insufficient stake");
+    require(peers[sourceEid] != bytes32(0), "No relay for source eid");
     // Cap pending submissions so slash-loop work stays within L2 block gas.
     require(pendingCount[msg.sender] < MAX_PENDING_PER_VALIDATOR, "TooManyPending");
     require(startCheckpointId > 0, "Invalid start");
@@ -349,6 +371,8 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
       status: Status.PENDING,
       dataCommitment: dataCommitment
     });
+
+    submissionSourceEid[submissionId] = sourceEid;
 
     for (uint256 cp = startCheckpointId; cp <= endCheckpointId; ) {
       checkpointClaimed[networkId][cp] = submissionId;
@@ -459,7 +483,9 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   ///         reverts "No challenge delivered". The reason code lets monitors and
   ///         the challenger detect+retry within the challenge window. (Audit finding
   ///         CCR-1.) reason: 1=not-pending, 2=networkId-mismatch,
-  ///         3=array-length-mismatch.
+  ///         3=array-length-mismatch, 4=no-over-reach (non-existence),
+  ///         5=wrong-source-eid (non-existence message came from a relay on
+  ///         an L2 other than the submission's sourceEid).
   event ChallengeDropped(uint256 indexed submissionId, uint8 reason);
 
   /// @dev Receives correct checkpoint hash from CawChallengeRelay via LZ.
@@ -478,7 +504,7 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   ///      RECOVERY: see the ChallengeDeliveryFailed docstring above for the
   ///      re-relay flow when this catch fires.
   function _lzReceive(
-    Origin calldata,
+    Origin calldata _origin,
     bytes32,
     bytes calldata payload,
     address,
@@ -489,7 +515,7 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     // ETH would be silently absorbed into the contract balance with no credit path.
     // Reject so a misconfigured peer surfaces immediately. (Audit finding LOW-3.)
     require(msg.value == 0, "no native drop");
-    try this._processChallenge(payload) {
+    try this._processChallenge(_origin.srcEid, payload) {
       // ok
     } catch (bytes memory reason) {
       emit ChallengeDeliveryFailed(payload, reason);
@@ -499,7 +525,7 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   /// @dev Isolated body of _lzReceive. External so _lzReceive can try/catch
   ///      it, but restricted to self-calls only — the explicit check plus
   ///      the fact that _lzReceive is the only caller make this safe.
-  function _processChallenge(bytes calldata payload) external {
+  function _processChallenge(uint32 srcEid, bytes calldata payload) external {
     require(msg.sender == address(this), "only self");
 
     // Every relay payload is prefixed with a message-type tag.
@@ -507,7 +533,7 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     // MSG_NONEXISTENCE (2): proof-of-non-existence — (tag, submissionId, networkId, sourceMaxCheckpoint, rewardTo).
     uint8 msgType = abi.decode(payload, (uint8));
     if (msgType == MSG_NONEXISTENCE) {
-      this._processNonExistence(payload);
+      this._processNonExistence(srcEid, payload);
       return;
     }
 
@@ -541,7 +567,7 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   ///      This closes the vector the bounded-lookahead can't: a low-volume network
   ///      whose source won't produce the fabricated checkpoints within the 2-day
   ///      window, leaving them un-challengeable until finalize.
-  function _processNonExistence(bytes calldata payload) external {
+  function _processNonExistence(uint32 srcEid, bytes calldata payload) external {
     require(msg.sender == address(this), "only self");
     (, uint256 submissionId, uint32 networkId, uint256 sourceMaxCheckpoint, address rewardTo) =
       abi.decode(payload, (uint8, uint256, uint32, uint256, address));
@@ -549,6 +575,9 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     Submission storage sub = submissions[submissionId];
     if (sub.status != Status.PENDING) { emit ChallengeDropped(submissionId, 1); return; }
     if (sub.networkId != networkId)   { emit ChallengeDropped(submissionId, 2); return; }
+    // The height is only meaningful on the chain that hosts the network. Any
+    // other L2 reports 0 for it, which would slash honest submissions.
+    if (submissionSourceEid[submissionId] != srcEid) { emit ChallengeDropped(submissionId, 5); return; }
     // Only slash if the submission genuinely over-reaches the source height. A
     // submission entirely within the source's real progress is honest replication.
     if (sub.endCheckpointId <= sourceMaxCheckpoint) { emit ChallengeDropped(submissionId, 4); return; }

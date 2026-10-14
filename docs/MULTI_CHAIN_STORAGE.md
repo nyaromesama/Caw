@@ -33,8 +33,8 @@ But the contracts already speak `storageChainEid` as a per-Network property — 
 
 The replication path is **already permissionless**:
 
-- `CawActionsArchive.submitReplication` only requires `stakes[msg.sender] >= MIN_STAKE`. It doesn't check anything Network-related.
-- The slashing path (`resolveChallenge`, `slashIncoherentRoot`) works against any submission on any archive chain that has a peer relationship with the relay.
+- `CawActionsArchive.submitReplication` requires `stakes[msg.sender] >= MIN_STAKE` and a peer relay for the declared `sourceEid` (the Network's storage chain). It doesn't check anything else Network-related.
+- The slashing path (`resolveChallenge`, `slashIncoherentRoot`) works against any submission on any archive chain that has a peer relationship with the relay. Non-existence messages only count when they come from the submission's `sourceEid`: a relay on a chain that doesn't host the Network reads `networkActionCount == 0` for it, and would otherwise "prove" every honest submission over-reaches. Challenge hashes need no such binding — the relay never sends a zero hash, and only the storage chain has non-zero checkpoint hashes for the Network.
 - An operator with stake on chain X can replicate any Network's batches to chain X, full stop.
 
 This means the CLI's replication question is a per-operator economic choice ("which chain do you have ETH on?"), not a per-Network constraint. Today the CLI lists the one deployed archive chain (Arbitrum Sepolia / Arbitrum One); the structure scales to N.
