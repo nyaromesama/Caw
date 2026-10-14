@@ -453,9 +453,10 @@ contract SponsoredMintFundingForkTest is Test {
         callerProxy.callMinter(address(minter), mintCalldata);
 
         // Same for depositForSponsored into an existing token.
+        uint256 targetNonce = userSmartEOA.nonceOf(address(minter), 1);
         vm.prank(UNIT_SPONSOR, UNIT_SPONSOR);
         minter.mintAndDepositSponsored(
-            1, address(userSmartEOA), "draintarget", 0, 0, 0, userSmartEOA.nonceOf(address(minter), 1), ANY_SIG, 0, 0, 0
+            1, address(userSmartEOA), "draintarget", 0, 0, 0, targetNonce, ANY_SIG, 0, 0, 0
         );
         bytes memory depositCalldata = abi.encodeWithSelector(
             CawProfileMinter.depositForSponsored.selector,
