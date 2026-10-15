@@ -123,7 +123,9 @@ const ViewOffersModal: React.FC = () => {
   // eventual offerer.
   const quoteOwner = eoaAccount ?? address
   const [acceptSyncLzFee, setAcceptSyncLzFee] = useState<bigint | null>(null)
+  const [acceptQuoteFailed, setAcceptQuoteFailed] = useState(false)
   useEffect(() => {
+    setAcceptQuoteFailed(false)
     if (!isOpen || !isOwner || !tokenId || !quoteOwner) { setAcceptSyncLzFee(null); return }
     let cancelled = false
     readContract(wagmiConfig, {
@@ -137,13 +139,17 @@ const ViewOffersModal: React.FC = () => {
       setAcceptSyncLzFee((quote.nativeFee * 110n) / 100n)
     }).catch(err => {
       console.warn('[ViewOffersModal] accept sync LZ fee quote failed:', err)
-      if (!cancelled) setAcceptSyncLzFee(null)
+      if (!cancelled) { setAcceptSyncLzFee(null); setAcceptQuoteFailed(true) }
     })
     return () => { cancelled = true }
   }, [isOpen, isOwner, tokenId, quoteOwner])
 
   // The accept call's own msg.value now carries the native L2 sync fee.
+  // Never send without it: the accept buttons stay disabled until the
+  // quote is in, and the send paths bail if it isn't. Not while disconnected:
+  // there the button is the "connect" entry point (ensureWallet).
   const lzFee = acceptSyncLzFee ?? 0n
+  const acceptFeePending = (isConnected || isPopB) && acceptSyncLzFee === null
 
   // After approval, auto-trigger the queued accept
   useEffect(() => {
@@ -152,6 +158,7 @@ const ViewOffersModal: React.FC = () => {
     if (pendingAcceptAfterApprove) {
       const offer = pendingAcceptAfterApprove
       setPendingAcceptAfterApprove(null)
+      if (acceptSyncLzFee === null) return
       setActionOfferId(offer.offerId)
       setActionType('accept')
       writeAction({
@@ -216,7 +223,7 @@ const ViewOffersModal: React.FC = () => {
   // acceptOffer now syncs L2 ownership natively in the same call.
   // The LZ fee (value=lzFee) self-funds from the EOA; relayer fronts only gas.
   const handlePopBAcceptOffer = useCallback(async (offer: MarketplaceOffer) => {
-    if (!isPopB || !eoaAccount || !l1Client) return
+    if (!isPopB || !eoaAccount || !l1Client || acceptSyncLzFee === null) return
     setPopBOfferError(null)
     setPopBPendingOfferId(offer.offerId)
     try {
@@ -282,7 +289,7 @@ const ViewOffersModal: React.FC = () => {
     } finally {
       setPopBPendingOfferId(null)
     }
-  }, [isPopB, eoaAccount, l1Client, lzFee, smartEoaExecute, triggerRefresh, t])
+  }, [isPopB, eoaAccount, l1Client, acceptSyncLzFee, lzFee, smartEoaExecute, triggerRefresh, t])
 
   const handleApproveNFT = () => {
     ensureWallet({ chainId: chains.l1.chainId }, async () => {
@@ -298,6 +305,9 @@ const ViewOffersModal: React.FC = () => {
 
   const handleAcceptOffer = (offer: MarketplaceOffer) => {
     ensureWallet({ chainId: chains.l1.chainId }, async () => {
+      // Also covers ensureWallet's deferred run after connecting (the
+      // closure from the click, before there was an owner to quote for).
+      if (acceptSyncLzFee === null) return
       setActionOfferId(offer.offerId)
       setActionType('accept')
       writeAction({
@@ -367,6 +377,12 @@ const ViewOffersModal: React.FC = () => {
         {lzFee > 0n && (
           <div className={`mb-3 text-xs ${themeTextMuted(isDark)}`}>
             {t('view_offers.lz_fee', { eth: parseFloat(formatEther(lzFee)).toFixed(5) })}
+          </div>
+        )}
+
+        {acceptQuoteFailed && (
+          <div className="mb-4 p-3 rounded-lg bg-red-500/10 text-red-500 text-sm text-center">
+            {t('marketplace.error.lz_fee_quote')}
           </div>
         )}
 
@@ -461,7 +477,7 @@ const ViewOffersModal: React.FC = () => {
                             handleAcceptOffer(offer)
                           })
                         }}
-                        disabled={isActing || isSwitchingChain || isApproving || isApproveConfirming || isPopBActing}
+                        disabled={isActing || isSwitchingChain || isApproving || isApproveConfirming || isPopBActing || acceptFeePending}
                         className="px-3 py-1.5 rounded-lg text-xs font-medium bg-yellow-500 text-black hover:bg-yellow-400 transition cursor-pointer disabled:opacity-50"
                       >
                         {isPopBActing ? t('view_offers.btn.accepting')

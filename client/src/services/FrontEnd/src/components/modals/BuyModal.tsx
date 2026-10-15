@@ -154,7 +154,9 @@ const BuyModal: React.FC = () => {
   // sale's own LZ send revert (LZ_InsufficientFee).
   const buyer = eoaAccount ?? address
   const [syncLzFee, setSyncLzFee] = useState<bigint | null>(null)
+  const [syncQuoteFailed, setSyncQuoteFailed] = useState(false)
   useEffect(() => {
+    setSyncQuoteFailed(false)
     if (!isOpen || !listing || !buyer) { setSyncLzFee(null); return }
     let cancelled = false
     readContract(wagmiConfig, {
@@ -168,7 +170,7 @@ const BuyModal: React.FC = () => {
       setSyncLzFee((quote.nativeFee * 110n) / 100n)
     }).catch(err => {
       console.warn('[BuyModal] sync LZ fee quote failed:', err)
-      if (!cancelled) setSyncLzFee(null)
+      if (!cancelled) { setSyncLzFee(null); setSyncQuoteFailed(true) }
     })
     return () => { cancelled = true }
   }, [isOpen, listing?.listingId, buyer])
@@ -176,8 +178,11 @@ const BuyModal: React.FC = () => {
   // The sale's own msg.value now carries the LZ sync fee (contract does
   // msg.value - price = lzFee for an ETH buy, or msg.value = lzFee for
   // buyWithToken). Fall back to 0n while the quote is loading so the UI
-  // doesn't flash a stale insufficientBalance state.
+  // doesn't flash a stale insufficientBalance state — but never SEND with
+  // that 0n: the buy buttons stay disabled until the quote is in
+  // (syncFeePending), and the handlers bail if it isn't.
   const lzFee = syncLzFee ?? 0n
+  const syncFeePending = !!buyer && syncLzFee === null
 
   // Current price for Dutch auctions
   const currentPrice = useMemo(() => {
@@ -268,7 +273,7 @@ const BuyModal: React.FC = () => {
   // fee self-fund from the EOA; the relayer fronts only gas.
   // forwardedValueWei=0 since no ETH from the relayer.
   const handlePopBBuy = useCallback(async () => {
-    if (!isPopB || !eoaAccount || !listing || !l1Client) return
+    if (!isPopB || !eoaAccount || !listing || !l1Client || syncLzFee === null) return
     setPopBError(null)
     setPopBPending(true)
     try {
@@ -358,7 +363,7 @@ const BuyModal: React.FC = () => {
     } finally {
       setPopBPending(false)
     }
-  }, [isPopB, eoaAccount, listing, l1Client, isEth, currentPrice, lzFee, smartEoaExecute, t])
+  }, [isPopB, eoaAccount, listing, l1Client, isEth, currentPrice, syncLzFee, lzFee, smartEoaExecute, t])
 
   const handleApprove = () => {
     ensureWallet({ chainId: chains.l1.chainId }, async () => {
@@ -376,7 +381,10 @@ const BuyModal: React.FC = () => {
 
   const handleBuy = () => {
     ensureWallet({ chainId: chains.l1.chainId }, async () => {
-      if (!listing) return
+      // Also covers ensureWallet's deferred run after connecting: that runs
+      // the closure from the click, when there was no buyer to quote for
+      // yet. Bail, and the user clicks again once the quote is in.
+      if (!listing || syncLzFee === null) return
 
       if (isEth) {
         writeBuy({
@@ -528,6 +536,12 @@ const BuyModal: React.FC = () => {
               </div>
             )}
 
+            {syncQuoteFailed && (
+              <div className={`text-xs mb-4 p-3 rounded-lg text-center ${isDark ? 'bg-red-500/10 text-red-400' : 'bg-red-50 text-red-500'}`}>
+                {t('marketplace.error.lz_fee_quote')}
+              </div>
+            )}
+
             {/* Staked CAW warning */}
             {listing.stakedCaw && listing.stakedCaw !== '0' && (
               <div className={`text-xs mb-4 p-3 rounded-lg ${isDark ? 'bg-yellow-500/10 text-yellow-400' : 'bg-yellow-50 text-yellow-700'}`}>
@@ -566,7 +580,7 @@ const BuyModal: React.FC = () => {
             {isPopB ? (
               <button
                 onClick={() => { setPopBError(null); handlePopBBuy() }}
-                disabled={isExpired || popBPending || insufficientBalance}
+                disabled={isExpired || popBPending || insufficientBalance || syncFeePending}
                 className="w-full px-4 py-2.5 rounded-lg text-sm font-medium bg-yellow-500 text-black hover:bg-yellow-400 transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-yellow-500"
               >
                 {isExpired ? t('buy_modal.button.ended')
@@ -603,7 +617,7 @@ const BuyModal: React.FC = () => {
                 {(isEth || hasApproval) && !isSuccess && (
                   <button
                     onClick={() => { if (writeError) resetBuy(); handleBuy() }}
-                    disabled={isExpired || isSubmitting || isConfirming || isSwitchingChain || insufficientBalance}
+                    disabled={isExpired || isSubmitting || isConfirming || isSwitchingChain || insufficientBalance || syncFeePending}
                     className="w-full px-4 py-2.5 rounded-lg text-sm font-medium bg-yellow-500 text-black hover:bg-yellow-400 transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-yellow-500"
                   >
                     {isExpired ? t('buy_modal.button.ended')

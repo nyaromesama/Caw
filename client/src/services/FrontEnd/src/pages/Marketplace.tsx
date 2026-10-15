@@ -589,7 +589,7 @@ const MyOffersTab: React.FC = () => {
   const quoteAndAccept = async (offer: MarketplaceOffer) => {
     if (!walletAddress) return
     setAcceptingId(offer.offerId)
-    let syncFee = 0n
+    let syncFee: bigint
     try {
       // Quote with the offer's tokenId and the offerer (the new owner):
       // tokenId=0 / address(0) quotes 0 on an empty queue.
@@ -602,7 +602,12 @@ const MyOffersTab: React.FC = () => {
       })
       syncFee = (quote.nativeFee * 110n) / 100n
     } catch (err) {
+      // Don't fall back to value 0: on a token chosen for the L2 the
+      // sale's own LZ send would revert with LZ_InsufficientFee.
       console.warn('[MyOffersTab] sync LZ fee quote failed:', err)
+      setAcceptFailureMessage(t('marketplace.error.lz_fee_quote'))
+      setAcceptingId(null)
+      return
     }
     writeAccept({
       address: CAW_NAME_MARKETPLACE_ADDRESS,
