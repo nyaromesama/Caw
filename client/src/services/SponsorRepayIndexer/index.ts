@@ -32,6 +32,15 @@ import { CAW_NAMES_MINTER_ADDRESS, CAW_NAMES_L2_ADDRESS } from '../../abi/addres
 import { Service } from '../../Service'
 import { prisma } from '../../prismaClient'
 
+// Allow tests to inject a mock Prisma client (same pattern as validateSponsorCode).
+let _prismaOverride: typeof prisma | null = null
+export function _setPrismaForTest(p: typeof prisma | null): void {
+  _prismaOverride = p
+}
+function getPrisma(): typeof prisma {
+  return _prismaOverride ?? prisma
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // ABI fragments — string form so we don't need to regenerate generated.ts
 // ──────────────────────────────────────────────────────────────────────────────
@@ -92,6 +101,11 @@ async function saveCheckpoint(redis: Redis, key: string, block: number): Promise
 // DB handlers — two-tx split NOT needed here: each is an independent atomic
 // row (no cross-table derived side-effects that could silently drop). Mirror
 // the fact row only.
+//
+// A failed DB write is rethrown, not swallowed: processEvents then rejects and
+// the poll loop holds its cursor, so the window is re-read and replayed in
+// order on the next tick (same as DepositWatcher). Swallowing it let the
+// cursor advance past an event that was never written, losing it for good.
 // ──────────────────────────────────────────────────────────────────────────────
 
 async function handleSponsorRepaySet(args: ethers.Result, txHash: string): Promise<void> {
@@ -102,7 +116,7 @@ async function handleSponsorRepaySet(args: ethers.Result, txHash: string): Promi
   const depositAmount = String(BigInt(args[3]))
 
   try {
-    await prisma.sponsorRepay.upsert({
+    await getPrisma().sponsorRepay.upsert({
       where:  { tokenId },
       create: {
         tokenId,
@@ -125,6 +139,7 @@ async function handleSponsorRepaySet(args: ethers.Result, txHash: string): Promi
     console.log(`[SponsorRepayIndexer:L1] SponsorRepaySet tokenId=${tokenId} sponsor=${sponsorTokenId} deposit=${depositAmount}`)
   } catch (err: any) {
     console.error(`[SponsorRepayIndexer:L1] Failed to upsert for tokenId=${tokenId}:`, err?.message)
+    throw err
   }
 }
 
@@ -134,7 +149,7 @@ async function handleSponsorRepayRegistered(args: ethers.Result, txHash: string)
   const repayAmount    = String(BigInt(args[2]))
 
   try {
-    await prisma.sponsorRepay.upsert({
+    await getPrisma().sponsorRepay.upsert({
       where:  { tokenId },
       create: {
         tokenId,
@@ -157,6 +172,7 @@ async function handleSponsorRepayRegistered(args: ethers.Result, txHash: string)
     console.log(`[SponsorRepayIndexer:L2] SponsorRepayRegistered tokenId=${tokenId} sponsor=${sponsorTokenId} repay=${repayAmount}`)
   } catch (err: any) {
     console.error(`[SponsorRepayIndexer:L2] Failed to upsert Registered for tokenId=${tokenId}:`, err?.message)
+    throw err
   }
 }
 
@@ -166,7 +182,7 @@ async function handleSponsorRepaySwept(args: ethers.Result): Promise<void> {
   const remaining = String(BigInt(args[3]))
 
   try {
-    await prisma.sponsorRepay.update({
+    await getPrisma().sponsorRepay.update({
       where: { tokenId },
       data: {
         currentRepayAmount: remaining,
@@ -176,9 +192,15 @@ async function handleSponsorRepaySwept(args: ethers.Result): Promise<void> {
     })
     console.log(`[SponsorRepayIndexer:L2] SponsorRepaySwept tokenId=${tokenId} swept=${swept} remaining=${remaining}`)
   } catch (err: any) {
-    // Row may not exist if SponsorRepayRegistered hasn't been indexed yet —
-    // log and move on; next Registered event will create it with current state.
-    console.warn(`[SponsorRepayIndexer:L2] Failed to update Swept for tokenId=${tokenId} (row may not exist yet):`, err?.message)
+    // P2025 = no row for this tokenId (its SponsorRepayRegistered was never
+    // indexed, e.g. it predates the start block). Re-reading the window won't
+    // create the row, so log and move on rather than stall the cursor.
+    if (err?.code === 'P2025') {
+      console.warn(`[SponsorRepayIndexer:L2] Skipping Swept for tokenId=${tokenId}: no SponsorRepay row`)
+      return
+    }
+    console.error(`[SponsorRepayIndexer:L2] Failed to update Swept for tokenId=${tokenId}:`, err?.message)
+    throw err
   }
 }
 
@@ -186,7 +208,7 @@ async function handleSponsorRepayForgiven(args: ethers.Result): Promise<void> {
   const tokenId = Number(args[0])
 
   try {
-    await prisma.sponsorRepay.update({
+    await getPrisma().sponsorRepay.update({
       where: { tokenId },
       data: {
         forgivenAt:        new Date(),
@@ -195,13 +217,24 @@ async function handleSponsorRepayForgiven(args: ethers.Result): Promise<void> {
     })
     console.log(`[SponsorRepayIndexer:L2] SponsorRepayForgiven tokenId=${tokenId}`)
   } catch (err: any) {
-    console.warn(`[SponsorRepayIndexer:L2] Failed to update Forgiven for tokenId=${tokenId}:`, err?.message)
+    // P2025 = no row to forgive (see Swept above): skip, don't stall.
+    if (err?.code === 'P2025') {
+      console.warn(`[SponsorRepayIndexer:L2] Skipping Forgiven for tokenId=${tokenId}: no SponsorRepay row`)
+      return
+    }
+    console.error(`[SponsorRepayIndexer:L2] Failed to update Forgiven for tokenId=${tokenId}:`, err?.message)
+    throw err
   }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Poll loop factory — shared logic for L1 and L2 sides
 // ──────────────────────────────────────────────────────────────────────────────
+
+// Cap for the retry backoff after failed polls (same as DepositWatcher):
+// pollMs, 2x, 4x, … up to 15 min, instead of re-polling every 250ms while a
+// held cursor keeps the loop "behind".
+const FAILURE_BACKOFF_CAP_MS = 15 * 60_000
 
 function makePollLoop(opts: {
   label:       string
@@ -218,6 +251,7 @@ function makePollLoop(opts: {
 }): { stop: () => void; start: () => void } {
   let timer: ReturnType<typeof setTimeout> | null = null
   let lastBlock = opts.startBlock
+  let consecutiveFailures = 0
 
   const poll = async () => {
     if (!opts.alive()) return
@@ -239,6 +273,8 @@ function makePollLoop(opts: {
         // lastBlock untouched so the same from..to window is retried on the
         // next tick. processEvents (idempotent per-tokenId upsert/update) runs
         // only after a fully successful fetch, so a retry never double-processes.
+        // processEvents itself rejects when a handler's DB write fails, which
+        // takes the same route: the window is re-read and replayed in order.
         const resultArrays = await Promise.all(
           eventNames.map(name =>
             opts.contract.queryFilter(opts.contract.filters[name](), from, to) as Promise<ethers.EventLog[]>
@@ -259,13 +295,21 @@ function makePollLoop(opts: {
         lastBlock = to
         await saveCheckpoint(opts.redis, opts.cpKey, to)
       }
+      consecutiveFailures = 0
       opts.heartbeat(opts.label)
     } catch (err: any) {
+      consecutiveFailures++
       console.error(`[${opts.label}] Poll error:`, err?.message || err)
     } finally {
       if (!opts.alive()) return
-      const behind = lastBlock < (await opts.provider.getBlockNumber().catch(() => lastBlock))
-      timer = setTimeout(poll, behind ? 250 : opts.pollMs)
+      let nextMs: number
+      if (consecutiveFailures > 0) {
+        nextMs = Math.min(opts.pollMs * 2 ** (consecutiveFailures - 1), FAILURE_BACKOFF_CAP_MS)
+      } else {
+        const behind = lastBlock < (await opts.provider.getBlockNumber().catch(() => lastBlock))
+        nextMs = behind ? 250 : opts.pollMs
+      }
+      timer = setTimeout(poll, nextMs)
     }
   }
 
@@ -273,6 +317,14 @@ function makePollLoop(opts: {
     start: () => { poll() },
     stop:  () => { if (timer) clearTimeout(timer) },
   }
+}
+
+export const _forTests = {
+  makePollLoop,
+  handleSponsorRepaySet,
+  handleSponsorRepayRegistered,
+  handleSponsorRepaySwept,
+  handleSponsorRepayForgiven,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
