@@ -16,15 +16,30 @@ import { elasticsearchService } from './ElasticsearchService'
  *                                              part thread reply in its own group;
  *                                              keying by the caw being replied to
  *                                              folds all chunks into one rollup)
- *   ACTION_FAILED                           → null (each row stays alone via
- *                                                   the duplicate-check in
- *                                                   the create call site)
+ *   ACTION_FAILED / OUTBID / AUCTION_WON /
+ *   SALE_SOLD / SALE_BOUGHT                 → `n:<notificationId>` (one group
+ *                                              per row)
+ *
+ * The singleton types carry everything the row renders in actionPayload
+ * (Retry payload, auction / sale details), and the feed only renders a
+ * group's latest member. Under a null key they shared one open bucket per
+ * (userId, type) — the partial unique index COALESCEs NULL to '' — so a
+ * second failure or a second won auction hid the first one's row.
  */
+const SINGLETON_TYPES: readonly NotificationType[] = [
+  NotificationType.ACTION_FAILED,
+  NotificationType.OUTBID,
+  NotificationType.AUCTION_WON,
+  NotificationType.SALE_SOLD,
+  NotificationType.SALE_BOUGHT,
+]
+
 function notificationTargetKey(
   type: NotificationType,
-  ctx: { cawId?: number | null; offerId?: number | null; parentCawId?: number | null }
+  ctx: { notificationId: number; cawId?: number | null; offerId?: number | null; parentCawId?: number | null }
 ): string | null {
-  if (type === NotificationType.FOLLOW || type === NotificationType.ACTION_FAILED) return null
+  if (SINGLETON_TYPES.includes(type)) return `n:${ctx.notificationId}`
+  if (type === NotificationType.FOLLOW) return null
   if (type === NotificationType.OFFER) return ctx.offerId != null ? String(ctx.offerId) : null
   if (type === NotificationType.REPLY) {
     return ctx.parentCawId != null ? String(ctx.parentCawId)
@@ -47,7 +62,7 @@ function notificationTargetKey(
  *
  * The partial unique index on `(userId, type, COALESCE(targetKey, ''))
  * WHERE isRead = false` enforces at most one open group per bucket.
- * The COALESCE handles the NULL targetKey case (FOLLOW, ACTION_FAILED)
+ * The COALESCE handles the NULL targetKey case (FOLLOW, profile TIP)
  * since Postgres treats NULLs as distinct in regular unique indexes.
  *
  * Always runs inside the caller's prisma client (so it composes with
@@ -71,7 +86,7 @@ export async function createNotificationWithGroup(
   // 2) Decide the bucket key.
   const targetKey = notificationTargetKey(
     notif.type as NotificationType,
-    { cawId: notif.cawId, offerId: notif.offerId, parentCawId: groupCtx?.parentCawId },
+    { notificationId: notif.id, cawId: notif.cawId, offerId: notif.offerId, parentCawId: groupCtx?.parentCawId },
   )
 
   // 3) Atomic upsert: if an open group already exists for this
@@ -123,6 +138,115 @@ export async function createNotificationWithGroup(
   })
 
   return notif.id
+}
+
+/**
+ * Dismiss the groups that the given notifications belong to.
+ *
+ * The feed shows one row per group and the × / Retry-success paths send
+ * that row's id, i.e. the group's latest member. Hiding only that member
+ * left the group in the feed (the list never filtered on `hidden`), and
+ * an open group kept collecting new events on top of the dismissed ones.
+ * So: close the group (the next event opens a fresh one) and hide + read
+ * every member. Rows from before the group table (groupId null) are
+ * hidden on their own.
+ *
+ * Returns the ids from `notificationIds` that belong to `userId`.
+ */
+export async function hideNotificationGroups(
+  client: { notification: any; notificationGroup: any },
+  userId: number,
+  notificationIds: number[],
+): Promise<number[]> {
+  const rows: Array<{ id: number; groupId: number | null }> = await client.notification.findMany({
+    where: { id: { in: notificationIds }, userId },
+    select: { id: true, groupId: true },
+  })
+  if (rows.length === 0) return []
+
+  const groupIds = Array.from(new Set(rows.map(r => r.groupId).filter((x): x is number => x != null)))
+  if (groupIds.length > 0) {
+    await client.notificationGroup.updateMany({
+      where: { id: { in: groupIds }, userId },
+      data: { isRead: true },
+    })
+    await client.notification.updateMany({
+      where: { groupId: { in: groupIds }, userId },
+      data: { hidden: true, isRead: true },
+    })
+  }
+  const ungrouped = rows.filter(r => r.groupId == null).map(r => r.id)
+  if (ungrouped.length > 0) {
+    await client.notification.updateMany({
+      where: { id: { in: ungrouped }, userId },
+      data: { hidden: true },
+    })
+  }
+  return rows.map(r => r.id)
+}
+
+/**
+ * One-shot, idempotent repair of groups written before the two fixes
+ * above. Nodes apply the schema with `prisma db push`, which never runs
+ * prisma/migrations, so this runs from the DataCleaner at startup instead.
+ *
+ *   1. Move every grouped row of a singleton type into its own
+ *      `n:<id>` group (they used to share one null-key bucket).
+ *   2. Delete the null-key singleton-type groups that step 1 emptied.
+ *      Only legacy keys: a group the current code just opened has an
+ *      `n:` key and may not have its member's groupId written yet.
+ *   3. Groups whose latest member is hidden were dismissed with × or by
+ *      a successful retry: close them and hide + read every member, the
+ *      same as hideNotificationGroups.
+ *
+ * Once applied, every step matches zero rows.
+ */
+export async function repairNotificationGroups(
+  client: { $transaction: any; $executeRawUnsafe: any } = prisma,
+): Promise<{ split: number; removed: number; dismissed: number }> {
+  const types = SINGLETON_TYPES.map(t => `'${t}'`).join(', ')
+  const [split, removed, dismissed]: number[] = await client.$transaction([
+    client.$executeRawUnsafe(`
+      WITH moved AS (
+        SELECT n.id, n."userId", n.type, n."createdAt", n."isRead"
+        FROM "Notification" n
+        JOIN "NotificationGroup" g ON g.id = n."groupId"
+        WHERE n.type IN (${types})
+          AND g."targetKey" IS DISTINCT FROM ('n:' || n.id)
+      ), ins AS (
+        INSERT INTO "NotificationGroup" (
+          "userId", "type", "targetKey", "openedAt", "lastEventAt",
+          "isRead", "latestNotificationId", "count"
+        )
+        SELECT "userId", type, 'n:' || id, "createdAt", "createdAt", "isRead", id, 1
+        FROM moved
+        RETURNING id, "latestNotificationId"
+      )
+      UPDATE "Notification" n SET "groupId" = ins.id
+      FROM ins WHERE n.id = ins."latestNotificationId"`),
+    client.$executeRawUnsafe(`
+      DELETE FROM "NotificationGroup" g
+      WHERE g.type IN (${types})
+        AND (g."targetKey" IS NULL OR g."targetKey" NOT LIKE 'n:%')
+        AND NOT EXISTS (SELECT 1 FROM "Notification" n WHERE n."groupId" = g.id)`),
+    client.$executeRawUnsafe(`
+      WITH dismissed AS (
+        SELECT g.id
+        FROM "NotificationGroup" g
+        JOIN "Notification" l ON l.id = g."latestNotificationId" AND l.hidden = true
+        WHERE g."isRead" = false
+           OR EXISTS (
+             SELECT 1 FROM "Notification" n
+             WHERE n."groupId" = g.id AND (n.hidden = false OR n."isRead" = false)
+           )
+      ), members AS (
+        UPDATE "Notification" n SET hidden = true, "isRead" = true
+        FROM dismissed d WHERE n."groupId" = d.id
+      )
+      UPDATE "NotificationGroup" g SET "isRead" = true
+      FROM dismissed d WHERE g.id = d.id`),
+  ])
+  return { split, removed, dismissed }
 }
 
 export class NotificationService {
