@@ -13,24 +13,30 @@
  * check every action against the first signature and revert the whole tx.
  *
  * Groups:
- *   - rows sharing a batchId: one ActionBatch signature over all of them,
- *     never split across txs
+ *   - rows of one batch: one ActionBatch signature over all of them, never
+ *     split across txs. A batch is keyed by (senderId, batchId, signedTx),
+ *     not batchId alone: the API allocates batchId as Date.now() & 0x7fffffff,
+ *     so two batches created in the same millisecond share it. The API stores
+ *     one sender and the batch sig on every row of a batch.
  *   - rows without a batchId: one ActionData signature each, a group of 1
  * Groups come out in the order of their first row, and rows keep their
  * queue order inside a group.
  */
-export function groupERC1271Rows<T extends { batchId?: number | null }>(rows: readonly T[]): T[][] {
+export function groupERC1271Rows<T extends { senderId: number; batchId?: number | null; signedTx?: string | null }>(
+  rows: readonly T[]
+): T[][] {
   const groups: T[][] = []
-  const byBatchId = new Map<number, T[]>()
+  const byBatch = new Map<string, T[]>()
   for (const row of rows) {
     if (row.batchId == null) {
       groups.push([row])
       continue
     }
-    let group = byBatchId.get(row.batchId)
+    const key = `${row.senderId}:${row.batchId}:${row.signedTx ?? ''}`
+    let group = byBatch.get(key)
     if (!group) {
       group = []
-      byBatchId.set(row.batchId, group)
+      byBatch.set(key, group)
       groups.push(group)
     }
     group.push(row)

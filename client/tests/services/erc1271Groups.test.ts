@@ -67,6 +67,27 @@ describe('groupERC1271Rows', () => {
     expect(ids(groupERC1271Rows(rows))).to.deep.equal([[1, 3], [2], [4]])
   })
 
+  it('keeps two senders\' batches apart when their batchIds match', () => {
+    // batchId is Date.now() & 0x7fffffff, so batches created in the same
+    // millisecond share it.
+    const rows = [
+      row(1, 2, 0, 777, blob('cc')),
+      row(2, 2, 1, 777, blob('cc')),
+      row(3, 3, 0, 777, blob('dd')),
+      row(4, 3, 1, 777, blob('dd')),
+    ]
+    expect(ids(groupERC1271Rows(rows))).to.deep.equal([[1, 2], [3, 4]])
+  })
+
+  it('keeps one sender\'s two batches apart when their batchIds match', () => {
+    const rows = [
+      row(1, 2, 0, 777, blob('cc')),
+      row(2, 2, 1, 777, blob('cc')),
+      row(3, 2, 2, 777, blob('ce')),
+    ]
+    expect(ids(groupERC1271Rows(rows))).to.deep.equal([[1, 2], [3]])
+  })
+
   it('every group has one sender and one signature', () => {
     const rows = [
       row(1, 2, 0, null, blob('aa')),

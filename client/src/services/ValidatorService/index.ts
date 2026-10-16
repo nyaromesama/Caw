@@ -1566,7 +1566,7 @@ export const validatorService: Service = {
       // started in this batch, we drop the WHOLE in-progress group and
       // try again next poll. If a single batch group genuinely doesn't
       // fit by itself, we mark every row in it failed with a clear
-      // "Batch too large to submit" reason — the API now caps at 256
+      // "Batch too large to submit" reason — the API now caps at 64
       // actions per batch (see /api/actions /batch), so this should be
       // unreachable in practice unless text payloads are huge.
       const MAX_BATCH_CALLDATA_BYTES = 120_000
@@ -2943,6 +2943,7 @@ console.log("succeededKeys", succeededKeys)
 
     /** natstat: core polling loop */
     async function pollLoop() {
+      const pollStartedAt = Date.now()
       await refreshSettings(checkInterval)
       // Cheap metric — one max(createdAt) query — so resolveCawonceUsed
       // can size its budget to the indexer's actual lag rather than a
@@ -3998,23 +3999,40 @@ console.log("succeededKeys", succeededKeys)
         // One signature group per tx (see groupERC1271Rows): the contract
         // reads a uint16 header per group, buildERC1271ActionData writes one
         // per tx, and the two agree only when the tx carries a single group.
-        // A group is never split. Groups past MAX_ERC1271_GROUPS_PER_POLL go
-        // back to 'pending' for the next poll — each group is a sequential
-        // send + wait, and the poll watchdog (pollTimeoutMs) restarts the
-        // service if one poll overruns.
+        // A group is never split. Each group is a sequential send + wait, and
+        // the poll watchdog (pollTimeoutMs) restarts the service if one poll
+        // overruns, so groups go back to 'pending' for the next poll when
+        // they are past MAX_ERC1271_GROUPS_PER_POLL, or when the poll has
+        // used half of pollTimeoutMs (on slow blocks 8 waits alone can
+        // exceed it). The first group is always sent.
         const MAX_ERC1271_CALLDATA_BYTES = 120_000
         const MAX_ERC1271_GROUPS_PER_POLL = 8
+        const erc1271TimeBudgetMs = pollTimeoutMs() / 2
         const erc1271Groups = groupERC1271Rows(validatedERC1271)
-        const erc1271Deferred = erc1271Groups.slice(MAX_ERC1271_GROUPS_PER_POLL).flat()
-        if (erc1271Deferred.length > 0) {
-          console.log(`[Validator] ERC-1271 group limit reached at ${MAX_ERC1271_GROUPS_PER_POLL} group(s). Deferring ${erc1271Deferred.length} entries to next poll.`)
+        const deferERC1271Groups = async (groups: typeof erc1271Groups, why: string) => {
+          const deferred = groups.flat()
+          if (deferred.length === 0) return
+          console.log(`[Validator] ${why}. Deferring ${deferred.length} ERC-1271 entries to next poll.`)
           await prisma.txQueue.updateMany({
-            where: { id: { in: erc1271Deferred.map(e => e.id) }, status: 'processing' },
+            where: { id: { in: deferred.map(e => e.id) }, status: 'processing' },
             data: { status: 'pending' },
           })
         }
+        await deferERC1271Groups(
+          erc1271Groups.slice(MAX_ERC1271_GROUPS_PER_POLL),
+          `ERC-1271 group limit reached at ${MAX_ERC1271_GROUPS_PER_POLL} group(s)`,
+        )
+        const erc1271ToSend = erc1271Groups.slice(0, MAX_ERC1271_GROUPS_PER_POLL)
 
-        for (const erc1271Bound of erc1271Groups.slice(0, MAX_ERC1271_GROUPS_PER_POLL)) {
+        for (let gi = 0; gi < erc1271ToSend.length; gi++) {
+          if (gi > 0 && Date.now() - pollStartedAt > erc1271TimeBudgetMs) {
+            await deferERC1271Groups(
+              erc1271ToSend.slice(gi),
+              `ERC-1271 time budget (${Math.round(erc1271TimeBudgetMs / 1000)}s of the poll) used after ${gi} group(s)`,
+            )
+            break
+          }
+          const erc1271Bound = erc1271ToSend[gi]
           let erc1271Finalized: Array<{ senderId: number; cawonce: number }> = []
           let erc1271SubmitError: string | null = null
           const erc1271Size = estimateERC1271GroupBytes(erc1271Bound)
