@@ -4326,9 +4326,9 @@ console.log("succeededKeys", succeededKeys)
       return { address, chainId: meta.chainId }
     }
 
-    // LZ eid of the L2 this validator reads actions from — the source chain of
-    // every network it replicates. The archive binds each submission to this
-    // eid and only accepts fraud proofs from that chain's relay. Read the
+    // LZ eid of the L2 this validator reads actions from. The archive keys
+    // every claim by (sourceEid, networkId) — each L2 has its own stream for a
+    // network — and only accepts fraud proofs from that eid's relay. Read the
     // chainId from the RPC itself: replicationHttpProvider pins its network.
     let sourceEid: number | null = null
     async function getSourceEid(): Promise<number> {
@@ -4377,8 +4377,9 @@ console.log("succeededKeys", succeededKeys)
       'function withdraw(uint256)',
       'function submitReplication(uint32 networkId, uint256 startCheckpointId, uint256 endCheckpointId, bytes packedActions, bytes32[] r, bytes32 merkleRoot, bytes32 entryHash, uint32 sourceEid)',
       'function finalizeSubmission(uint256 submissionId)',
-      'function checkpointClaimed(uint32, uint256) view returns (uint256)',
-      'function isRangeAvailable(uint32 networkId, uint256 start, uint256 end) view returns (bool)',
+      'function checkpointClaimed(uint32, uint32, uint256) view returns (uint256)',
+      'function isRangeAvailable(uint32 sourceEid, uint32 networkId, uint256 start, uint256 end) view returns (bool)',
+      'function submissionSourceEid(uint256) view returns (uint32)',
       'function getSubmission(uint256) view returns (address submitter, bytes32 merkleRoot, uint32 networkId, uint256 startCheckpointId, uint256 endCheckpointId, uint256 finalizedAt, uint8 status)',
       'function nextSubmissionId() view returns (uint256)',
       'event SubmissionCreated(uint256 indexed submissionId, address indexed submitter, uint32 indexed networkId, uint256 startCheckpointId, uint256 endCheckpointId, bytes32 merkleRoot)',
@@ -4990,6 +4991,7 @@ console.log("succeededKeys", succeededKeys)
 
 
         const httpProvider = replicationHttpProvider
+        const srcEid = await getSourceEid()
         // V1→V2 rename: clientActionCount → networkActionCount. Calling the
         // old name reverts with no data, which ethers wraps as a bare "Call
         // exception" and the outer catch surfaces as "Failed for network N:
@@ -5006,7 +5008,7 @@ console.log("succeededKeys", succeededKeys)
             // 3. Find unreplicated checkpoint range on L2b archive
             let startCheckpointId = 0
             for (let cp = 1; cp <= totalCheckpoints; cp++) {
-              const claimed = Number(await archive.checkpointClaimed(client.id, cp))
+              const claimed = Number(await archive.checkpointClaimed(srcEid, client.id, cp))
               if (claimed === 0) {
                 startCheckpointId = cp
                 break
@@ -5019,13 +5021,13 @@ console.log("succeededKeys", succeededKeys)
             let endCheckpointId = startCheckpointId
             const maxEnd = Math.min(totalCheckpoints, startCheckpointId + 255)
             for (let cp = startCheckpointId + 1; cp <= maxEnd; cp++) {
-              const claimed = Number(await archive.checkpointClaimed(client.id, cp))
+              const claimed = Number(await archive.checkpointClaimed(srcEid, client.id, cp))
               if (claimed !== 0) break
               endCheckpointId = cp
             }
 
             // Verify range is still available (atomic check)
-            const rangeAvailable = await archive.isRangeAvailable(client.id, startCheckpointId, endCheckpointId)
+            const rangeAvailable = await archive.isRangeAvailable(srcEid, client.id, startCheckpointId, endCheckpointId)
             if (!rangeAvailable) {
               console.log(`[OptimisticReplication] Network ${client.id}: range ${startCheckpointId}..${endCheckpointId} no longer available, skipping`)
               continue
@@ -5128,7 +5130,6 @@ console.log("succeededKeys", succeededKeys)
 
             // 6. Submit to L2b archive
             const packedHex = bytesToHex(data.packedBytes)
-            const srcEid = await getSourceEid()
 
             // Pre-flight simulation
             try {
@@ -5447,6 +5448,11 @@ console.log("succeededKeys", succeededKeys)
      * Checks that submitted checkpoint hashes match L2's on-chain hashes.
      * Logs warnings on mismatch (actual challenge submission is a follow-up).
      */
+    // Submissions that copy another L2's stream. Their checkpoint hashes come
+    // from that L2, not ours, and the archive drops our relay's fraud proofs
+    // against them (ChallengeDropped reason 5), so they are skipped for good.
+    const otherStreamSubmissions = new Set<number>()
+
     async function monitorOptimisticSubmissions() {
       try {
         // Same gate as the replication loop: without the archive RPC there
@@ -5474,6 +5480,7 @@ console.log("succeededKeys", succeededKeys)
         const httpProvider = replicationHttpProvider
         const hashCheckAbi = ['function networkHashAtCheckpoint(uint32,uint256) view returns (bytes32)']
         const actionsView = new Contract(CAW_ACTIONS_ADDRESS, hashCheckAbi, httpProvider)
+        const srcEid = await getSourceEid()
 
         // Persistent cache of submissions whose status is permanently
         // resolved (slashed / finalized / invalidated). Each monitor
@@ -5506,6 +5513,13 @@ console.log("succeededKeys", succeededKeys)
           // Skip submissions we already know are resolved (saves a
           // getSubmission view call per cycle).
           if (resolvedSet.has(submissionId)) continue
+          if (otherStreamSubmissions.has(submissionId)) continue
+          try {
+            if (Number(await archive.submissionSourceEid(submissionId)) !== srcEid) {
+              otherStreamSubmissions.add(submissionId)
+              continue
+            }
+          } catch { continue }
 
           // Check if still pending
           let merkleRoot: string

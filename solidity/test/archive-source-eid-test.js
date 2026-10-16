@@ -3,12 +3,12 @@ const LzReceiveHelper = artifacts.require("LzReceiveHelper");
 const truffleAssert = require('truffle-assertions');
 
 // The archive is peered with the relay on EVERY other L2 (deploy.js phase 5,
-// full mesh). A relay on an L2 that does not host the network reads
-// networkActionCount == 0 for it, so its non-existence proof says
-// sourceMaxCheckpoint == 0 — which every honest submission "exceeds".
-// Non-existence messages must only count when they come from the submission's
-// source L2. Challenge hashes need no binding: the relay never sends a zero
-// hash, and only the network's own chain has non-zero ones.
+// full mesh), and a network can have its own action stream on more than one of
+// them (a token can be authenticated on any L2). So each submission names the
+// L2 whose stream it copies, claims are keyed by (sourceEid, networkId), and
+// fraud proofs — non-existence and challenge hashes alike — only count when
+// they come from that L2's relay. Otherwise a relay on an L2 with no (or a
+// different) stream for the network could slash an honest copy.
 
 function buildPackedActions(actionCount) {
   const buf = Buffer.alloc(2 + actionCount * 25);
@@ -20,6 +20,14 @@ function buildPackedActions(actionCount) {
     buf.writeUInt8(0, off + 21); buf.writeUInt8(0, off + 22); buf.writeUInt16BE(0, off + 23);
   }
   return '0x' + buf.toString('hex');
+}
+
+function rpc(method, params) {
+  const p = web3.currentProvider;
+  if (typeof p.request === 'function') return p.request({ method, params });
+  return new Promise((res, rej) => p.send(
+    { jsonrpc: '2.0', id: Date.now(), method, params },
+    (err, out) => err ? rej(err) : res(out)));
 }
 
 function buildRValues(count) {
@@ -120,16 +128,53 @@ contract("CawActionsArchive — source eid binding", function(accounts) {
     assert.equal(rewardAfter.sub(rewardBefore).toString(), MIN_STAKE);
   });
 
-  it("challenge hashes from the real source still land when the submitter declared another eid", async function() {
+  it("challenge hashes only land from the submission's source L2", async function() {
     const validator = accounts[6];
     const sid = await submit(validator, 5, OTHER_EID);
     const hash = '0x' + '22'.repeat(32);
 
-    // Only the network's own chain has non-zero checkpoint hashes for it, and
-    // the relay never sends a zero hash, so this is the canonical value.
-    await deliver(HOME_EID, HOME_RELAY, challenge(sid, 5, hash));
+    // HOME_EID's checkpoint 5 belongs to HOME_EID's stream, not to the one
+    // this submission copies.
+    const tx = await deliver(HOME_EID, HOME_RELAY, challenge(sid, 5, hash));
+    await truffleAssert.eventEmitted(
+      await truffleAssert.createTransactionResult(archive, tx.tx),
+      'ChallengeDropped',
+      ev => ev.submissionId.toString() === sid.toString() && ev.reason.toString() === '5'
+    );
+    assert.equal(await archive.challengeDelivered(sid, 5), false);
+
+    await deliver(OTHER_EID, OTHER_RELAY, challenge(sid, 5, hash));
     assert.equal(await archive.challengeDelivered(sid, 5), true);
     assert.equal(await archive.challengeHash(sid, 5), hash);
+  });
+
+  it("a finalized copy of another L2's stream does not block the source L2's checkpoints", async function() {
+    const validator = accounts[7];
+    const sid = await submit(validator, 6, OTHER_EID);
+    assert.equal((await archive.checkpointClaimed(OTHER_EID, NETWORK_ID, 6)).toString(), sid.toString());
+    assert.equal((await archive.checkpointClaimed(HOME_EID, NETWORK_ID, 6)).toString(), '0');
+
+    const period = Number(await archive.CHALLENGE_PERIOD());
+    await rpc('evm_increaseTime', [period + 1]);
+    await rpc('evm_mine', []);
+    await archive.finalizeSubmission(sid);
+    assert.equal((await archive.getSubmission(sid)).status.toString(), '1'); // FINALIZED
+    assert.equal((await archive.lastFinalizedCheckpoint(OTHER_EID, NETWORK_ID)).toString(), '6');
+    assert.equal((await archive.lastFinalizedCheckpoint(HOME_EID, NETWORK_ID)).toString(), '0');
+
+    // Another validator can still replicate HOME_EID's checkpoint 6.
+    const homeSid = await submit(accounts[8], 6, HOME_EID);
+    assert.equal((await archive.checkpointClaimed(HOME_EID, NETWORK_ID, 6)).toString(), homeSid.toString());
+
+    // But the same stream's checkpoint stays taken.
+    await archive.deposit({ from: accounts[9], value: MIN_STAKE });
+    try {
+      await archive.submitReplication.call(
+        NETWORK_ID, 6, 6, buildPackedActions(32), buildRValues(32), ROOT, ZERO32, OTHER_EID,
+        { from: accounts[9] }
+      );
+      assert.fail("Should revert");
+    } catch (err) { assert(err.message.includes("Checkpoint already claimed"), err.message); }
   });
 
   it("rejects a submission whose source eid has no relay peer", async function() {

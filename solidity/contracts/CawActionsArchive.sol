@@ -128,28 +128,32 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   ///         the Submission struct remain compatible.
   mapping(uint256 => uint256) internal validatorSubmissionsIndexPlusOne;
 
-  /// @notice LZ eid of the source L2 the submitter says this submission's
-  ///         network lives on. Non-existence messages are only accepted from
-  ///         this eid's peer relay. Without the binding, a relay on ANY peered
-  ///         L2 could deliver one: on a chain that doesn't host the network,
-  ///         networkActionCount is 0, so sourceMaxCheckpoint is 0 and every
-  ///         honest submission "over-reaches".
-  ///         A submitter who declares the wrong (peered) eid gains nothing: on
-  ///         that chain the network's count is 0, so a non-existence relay from
-  ///         it slashes them.
-  ///         Challenge hashes are NOT bound to this eid: the relay never sends
-  ///         a zero hash, and only the chain that hosts the network has
-  ///         non-zero checkpoint hashes for it, so they can only come from the
-  ///         real source — even when the submitter declared another eid.
+  /// @notice LZ eid of the source L2 whose action stream this submission
+  ///         replicates. Fraud proofs (challenge hashes and non-existence) are
+  ///         only accepted from this eid's peer relay.
+  ///
+  ///         A network has one action stream per L2, not one in total: a token
+  ///         can be authenticated on any L2 (CawProfile.authenticate takes a
+  ///         caller-chosen lzDestId) and CawActions does not check the
+  ///         network's storageChainEid, so the same networkId can have its own
+  ///         checkpoint chain on several L2s. The archive therefore keys every
+  ///         claim by (sourceEid, networkId) and never compares one L2's stream
+  ///         against another's. Which stream is canonical for a network is the
+  ///         reader's call (its storageChainEid on L1), not the archive's.
+  ///
+  ///         Declaring an eid is not a way out of a fraud proof: a submission
+  ///         can only be proven wrong by the L2 it claims to copy, and a stream
+  ///         that does not exist there (networkActionCount 0) is slashed by a
+  ///         non-existence proof from that same L2.
   ///         Kept out of the Submission struct for the same layout reason as
   ///         validatorSubmissionsIndexPlusOne.
   mapping(uint256 => uint32) public submissionSourceEid;
 
-  /// @notice networkId => checkpointId => submissionId that covers it
-  mapping(uint32 => mapping(uint256 => uint256)) public checkpointClaimed;
+  /// @notice sourceEid => networkId => checkpointId => submissionId that covers it
+  mapping(uint32 => mapping(uint32 => mapping(uint256 => uint256))) public checkpointClaimed;
 
-  // ── Bounded-lookahead per network ───────────────────────────────────────────
-  // Highest checkpoint id finalized so far for a network. A submission may not
+  // ── Bounded-lookahead per (sourceEid, network) stream ──────────────────────
+  // Highest checkpoint id finalized so far for a stream. A submission may not
   // reach more than LOOKAHEAD_WINDOW checkpoints past this. Without the bound, an
   // attacker could submit fabricated data for FAR-FUTURE checkpoints (e.g. cpId
   // 10000 when the source has reached cpId 5): those slots have
@@ -160,12 +164,12 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   // realistically have produced within the challenge window, keeping every
   // submission challengeable. A small fabricated lookahead is still possible but
   // is challengeable as soon as the source produces the real hash (in-window).
-  mapping(uint32 => uint256) public lastFinalizedCheckpoint;
+  mapping(uint32 => mapping(uint32 => uint256)) public lastFinalizedCheckpoint;
 
-  /// @notice networkId => checkpointId => earliest timestamp at which the checkpoint can be
+  /// @notice sourceEid => networkId => checkpointId => earliest timestamp at which the checkpoint can be
   ///         re-claimed. Set to block.timestamp + CLAIM_COOLDOWN on every slash so attacker
   ///         bots cannot immediately re-claim within 1-2 blocks after a slash.
-  mapping(uint32 => mapping(uint256 => uint64)) public checkpointClaimReopensAt;
+  mapping(uint32 => mapping(uint32 => mapping(uint256 => uint64))) public checkpointClaimReopensAt;
 
   /// @notice submissionId => checkpointId => correctHash from LZ
   mapping(uint256 => mapping(uint256 => bytes32)) public challengeHash;
@@ -291,9 +295,9 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   ///                   value fed into the hash chain as the initial
   ///                   "prev" hash — committing it lets slashIncoherentRoot
   ///                   verify the full fold deterministically.
-  /// @param sourceEid  LZ eid of the L2 that hosts `networkId` (its
-  ///                   storageChainEid). Must have a peer relay here, or no
-  ///                   non-existence proof could ever reach this submission.
+  /// @param sourceEid  LZ eid of the L2 whose stream for `networkId` this
+  ///                   submission copies. Must have a peer relay here, or no
+  ///                   fraud proof could ever reach this submission.
   function submitReplication(
     uint32 networkId,
     uint256 startCheckpointId,
@@ -317,7 +321,7 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     // blocked, while a far-future jump (cpId 10000 when the chain is near 0) is
     // rejected — closing the un-challengeable-future-checkpoint poisoning.
     require(
-      endCheckpointId <= lastFinalizedCheckpoint[networkId] + LOOKAHEAD_WINDOW,
+      endCheckpointId <= lastFinalizedCheckpoint[sourceEid][networkId] + LOOKAHEAD_WINDOW,
       "Checkpoint too far ahead"
     );
 
@@ -345,8 +349,8 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
 
     // Ensure no checkpoint in the range is already claimed or within its post-slash cooldown
     for (uint256 cp = startCheckpointId; cp <= endCheckpointId; ) {
-      require(checkpointClaimed[networkId][cp] == 0, "Checkpoint already claimed");
-      require(block.timestamp >= checkpointClaimReopensAt[networkId][cp], "Claim cooldown");
+      require(checkpointClaimed[sourceEid][networkId][cp] == 0, "Checkpoint already claimed");
+      require(block.timestamp >= checkpointClaimReopensAt[sourceEid][networkId][cp], "Claim cooldown");
       unchecked { ++cp; }
     }
 
@@ -375,7 +379,7 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     submissionSourceEid[submissionId] = sourceEid;
 
     for (uint256 cp = startCheckpointId; cp <= endCheckpointId; ) {
-      checkpointClaimed[networkId][cp] = submissionId;
+      checkpointClaimed[sourceEid][networkId][cp] = submissionId;
       unchecked { ++cp; }
     }
 
@@ -412,11 +416,12 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     sub.status = Status.FINALIZED;
     pendingCount[sub.submitter]--;
 
-    // ARC-FUTURE-1: advance the network's finalized high-water mark so the
+    // ARC-FUTURE-1: advance the stream's finalized high-water mark so the
     // lookahead bound tracks real progress. Submissions can finalize out of
     // order, so only move it forward (max), never back.
-    if (sub.endCheckpointId > lastFinalizedCheckpoint[sub.networkId]) {
-      lastFinalizedCheckpoint[sub.networkId] = sub.endCheckpointId;
+    uint32 srcEid = submissionSourceEid[submissionId];
+    if (sub.endCheckpointId > lastFinalizedCheckpoint[srcEid][sub.networkId]) {
+      lastFinalizedCheckpoint[srcEid][sub.networkId] = sub.endCheckpointId;
     }
 
     // Prune from validatorSubmissions via swap-and-pop. Without this, a
@@ -484,8 +489,8 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   ///         the challenger detect+retry within the challenge window. (Audit finding
   ///         CCR-1.) reason: 1=not-pending, 2=networkId-mismatch,
   ///         3=array-length-mismatch, 4=no-over-reach (non-existence),
-  ///         5=wrong-source-eid (non-existence message came from a relay on
-  ///         an L2 other than the submission's sourceEid).
+  ///         5=wrong-source-eid (the message came from a relay on an L2 other
+  ///         than the submission's sourceEid).
   event ChallengeDropped(uint256 indexed submissionId, uint8 reason);
 
   /// @dev Receives correct checkpoint hash from CawChallengeRelay via LZ.
@@ -546,6 +551,9 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     if (sub.status != Status.PENDING) { emit ChallengeDropped(submissionId, 1); return; }
     if (sub.networkId != networkId)   { emit ChallengeDropped(submissionId, 2); return; }
     if (cps.length != hashes.length)  { emit ChallengeDropped(submissionId, 3); return; }
+    // Another L2's stream for the same networkId has its own, different
+    // checkpoint hashes; comparing against them would slash an honest copy.
+    if (submissionSourceEid[submissionId] != srcEid) { emit ChallengeDropped(submissionId, 5); return; }
 
     uint256 start = sub.startCheckpointId;
     uint256 end = sub.endCheckpointId;
@@ -575,8 +583,9 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
     Submission storage sub = submissions[submissionId];
     if (sub.status != Status.PENDING) { emit ChallengeDropped(submissionId, 1); return; }
     if (sub.networkId != networkId)   { emit ChallengeDropped(submissionId, 2); return; }
-    // The height is only meaningful on the chain that hosts the network. Any
-    // other L2 reports 0 for it, which would slash honest submissions.
+    // The height is only meaningful on the L2 whose stream this submission
+    // copies. Another L2 may report 0 (or any other height) for the network,
+    // which would slash honest submissions.
     if (submissionSourceEid[submissionId] != srcEid) { emit ChallengeDropped(submissionId, 5); return; }
     // Only slash if the submission genuinely over-reaches the source height. A
     // submission entirely within the source's real progress is honest replication.
@@ -644,9 +653,10 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
       Submission storage s = submissions[sid];
       if (s.status == Status.PENDING) {
         s.status = Status.SLASHED;
+        uint32 sEid = submissionSourceEid[sid];
         for (uint256 cp = s.startCheckpointId; cp <= s.endCheckpointId; ) {
-          checkpointClaimed[s.networkId][cp] = 0;
-          checkpointClaimReopensAt[s.networkId][cp] = uint64(block.timestamp + CLAIM_COOLDOWN);
+          checkpointClaimed[sEid][s.networkId][cp] = 0;
+          checkpointClaimReopensAt[sEid][s.networkId][cp] = uint64(block.timestamp + CLAIM_COOLDOWN);
           unchecked { ++cp; }
         }
       }
@@ -826,9 +836,9 @@ contract CawActionsArchive is ReentrancyGuard, OnlyOnce, OApp {
   // VIEW HELPERS
   // ============================================
 
-  function isRangeAvailable(uint32 networkId, uint256 start, uint256 end) external view returns (bool) {
+  function isRangeAvailable(uint32 sourceEid, uint32 networkId, uint256 start, uint256 end) external view returns (bool) {
     for (uint256 cp = start; cp <= end; ) {
-      if (checkpointClaimed[networkId][cp] != 0) return false;
+      if (checkpointClaimed[sourceEid][networkId][cp] != 0) return false;
       unchecked { ++cp; }
     }
     return true;

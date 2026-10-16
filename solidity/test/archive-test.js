@@ -206,8 +206,8 @@ contract("CawActionsArchive", function(accounts) {
     assert.equal(stake.toString(), '0');
 
     // Checkpoints released
-    assert.equal((await archive.checkpointClaimed(1, 4)).toNumber(), 0);
-    assert.equal((await archive.checkpointClaimed(1, 5)).toNumber(), 0);
+    assert.equal((await archive.checkpointClaimed(L2_EID, 1, 4)).toNumber(), 0);
+    assert.equal((await archive.checkpointClaimed(L2_EID, 1, 5)).toNumber(), 0);
 
     // Challenger received funds
     const balAfter = BigInt(await web3.eth.getBalance(accounts[3]));
@@ -253,8 +253,8 @@ contract("CawActionsArchive", function(accounts) {
     assert.equal(sub2.status.toNumber(), 2); // SLASHED
 
     // All checkpoints released
-    assert.equal((await archive.checkpointClaimed(1, 6)).toNumber(), 0);
-    assert.equal((await archive.checkpointClaimed(1, 7)).toNumber(), 0);
+    assert.equal((await archive.checkpointClaimed(L2_EID, 1, 6)).toNumber(), 0);
+    assert.equal((await archive.checkpointClaimed(L2_EID, 1, 7)).toNumber(), 0);
 
     // Pending count is 0
     assert.equal((await archive.pendingCount(accounts[4])).toNumber(), 0);
@@ -287,8 +287,8 @@ contract("CawActionsArchive", function(accounts) {
   });
 
   it("should check range availability", async function() {
-    assert.equal(await archive.isRangeAvailable(1, 9, 15), true);
-    assert.equal(await archive.isRangeAvailable(1, 8, 9), false); // 8 is claimed
+    assert.equal(await archive.isRangeAvailable(L2_EID, 1, 9, 15), true);
+    assert.equal(await archive.isRangeAvailable(L2_EID, 1, 8, 9), false); // 8 is claimed
     console.log("Range availability: PASS");
   });
 
