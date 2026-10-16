@@ -110,8 +110,7 @@ export async function createNotificationWithGroup(
     ? (client as any)
     : prisma
 
-  const rows: Array<{ id: number }> = await rawClient.$queryRawUnsafe(
-    `INSERT INTO "NotificationGroup" (
+  const upsert = `INSERT INTO "NotificationGroup" (
        "userId", "type", "targetKey", "openedAt", "lastEventAt",
        "isRead", "latestNotificationId", "count"
      ) VALUES ($1, $2::\"NotificationType\", $3, $4, $4, false, $5, 1)
@@ -121,69 +120,45 @@ export async function createNotificationWithGroup(
        "count"                = "NotificationGroup"."count" + 1,
        "lastEventAt"          = EXCLUDED."lastEventAt",
        "latestNotificationId" = EXCLUDED."latestNotificationId"
-     RETURNING id`,
+     RETURNING id`
+
+  // 4) Back-reference the new notification to its group in the same
+  //    statement as the join. As two statements, a dismissal
+  //    (hideNotificationGroups) landing in between closed and hid the
+  //    group without this row, which then sat visible in a closed group.
+  //    The global-prisma fallback can't see a row created inside the
+  //    caller's transaction, so it keeps the separate update.
+  const sameClient = rawClient === client
+  const rows: Array<{ id: number }> = await rawClient.$queryRawUnsafe(
+    sameClient
+      ? `WITH g AS (${upsert})
+         UPDATE "Notification" n SET "groupId" = g.id
+         FROM g WHERE n.id = $5
+         RETURNING g.id AS id`
+      : upsert,
     notif.userId,
     notif.type,
     targetKey,
     now,
     notif.id,
   )
+  if (rows.length === 0) {
+    throw new Error(`createNotificationWithGroup: notification ${notif.id} not found for its group back-reference`)
+  }
 
-  const groupId = rows[0].id
-
-  // 4) Back-reference the new notification to its group.
-  await client.notification.update({
-    where: { id: notif.id },
-    data: { groupId },
-  })
+  if (!sameClient) {
+    await client.notification.update({
+      where: { id: notif.id },
+      data: { groupId: rows[0].id },
+    })
+  }
 
   return notif.id
 }
 
-/**
- * Dismiss the groups that the given notifications belong to.
- *
- * The feed shows one row per group and the × / Retry-success paths send
- * that row's id, i.e. the group's latest member. Hiding only that member
- * left the group in the feed (the list never filtered on `hidden`), and
- * an open group kept collecting new events on top of the dismissed ones.
- * So: close the group (the next event opens a fresh one) and hide + read
- * every member. Rows from before the group table (groupId null) are
- * hidden on their own.
- *
- * Returns the ids from `notificationIds` that belong to `userId`.
- */
-export async function hideNotificationGroups(
-  client: { notification: any; notificationGroup: any },
-  userId: number,
-  notificationIds: number[],
-): Promise<number[]> {
-  const rows: Array<{ id: number; groupId: number | null }> = await client.notification.findMany({
-    where: { id: { in: notificationIds }, userId },
-    select: { id: true, groupId: true },
-  })
-  if (rows.length === 0) return []
-
-  const groupIds = Array.from(new Set(rows.map(r => r.groupId).filter((x): x is number => x != null)))
-  if (groupIds.length > 0) {
-    await client.notificationGroup.updateMany({
-      where: { id: { in: groupIds }, userId },
-      data: { isRead: true },
-    })
-    await client.notification.updateMany({
-      where: { groupId: { in: groupIds }, userId },
-      data: { hidden: true, isRead: true },
-    })
-  }
-  const ungrouped = rows.filter(r => r.groupId == null).map(r => r.id)
-  if (ungrouped.length > 0) {
-    await client.notification.updateMany({
-      where: { id: { in: ungrouped }, userId },
-      data: { hidden: true },
-    })
-  }
-  return rows.map(r => r.id)
-}
+// Lives in its own module (no imports) so scripts can use it without
+// pulling in this file's prisma / Elasticsearch side effects.
+export { hideNotificationGroups } from './NotificationGroups'
 
 /**
  * One-shot, idempotent repair of groups written before the two fixes

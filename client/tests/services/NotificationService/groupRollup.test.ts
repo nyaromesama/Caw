@@ -46,6 +46,7 @@ function makeStubClient() {
   let nextNotifId = 1
   const groups = new Map<number, GroupRow>()
   const notifs = new Map<number, NotifRow>()
+  let updateCalls = 0
 
   function matchesNotif(n: NotifRow, where: any): boolean {
     if (where.userId != null && n.userId !== where.userId) return false
@@ -118,6 +119,7 @@ function makeStubClient() {
         return row
       },
       async update({ where, data }: { where: { id: number }; data: any }) {
+        updateCalls++
         const row = notifs.get(where.id)
         if (!row) throw new Error(`Notification ${where.id} not found`)
         Object.assign(row, data)
@@ -157,9 +159,10 @@ function makeStubClient() {
     },
     // Simulate $queryRawUnsafe: intercept the INSERT … ON CONFLICT and
     // execute the in-memory upsert instead. We parse the arguments by
-    // position since the SQL template is fixed.
+    // position since the SQL template is fixed. The WITH … UPDATE
+    // "Notification" form also writes the row's groupId, as Postgres does.
     async $queryRawUnsafe(
-      _sql: string,
+      sql: string,
       userId: number,
       type: string,
       targetKey: string | null,
@@ -167,8 +170,14 @@ function makeStubClient() {
       latestNotifId: number,
     ): Promise<Array<{ id: number }>> {
       const id = upsertGroup(userId, type, targetKey, now, latestNotifId)
+      if (sql.includes('UPDATE "Notification"')) {
+        const row = notifs.get(latestNotifId)
+        if (!row) return []
+        row.groupId = id
+      }
       return [{ id }]
     },
+    get _updateCalls() { return updateCalls },
     // Expose internals for assertions.
     _groups: groups,
     _notifs: notifs,
@@ -196,6 +205,22 @@ describe('createNotificationWithGroup / rollup semantics', () => {
     expect(g.count).to.equal(1)
     expect(g.isRead).to.equal(false)
     expect(g.targetKey).to.equal('42')
+  })
+
+  // A dismissal between the group join and the row's groupId write used to
+  // close the group without this row. Both now happen in one statement.
+  it('joins the group and writes the groupId back in one raw statement', async () => {
+    const client = makeStubClient()
+    const id = await createNotificationWithGroup(client as any, {
+      userId: 1,
+      actorId: 10,
+      type: 'LIKE' as any,
+      cawId: 42,
+      createdAt: new Date('2026-01-01T10:00:00Z'),
+    })
+    const [g] = client._groups.values()
+    expect(client._notifs.get(id)!.groupId).to.equal(g.id)
+    expect(client._updateCalls).to.equal(0)
   })
 
   it('second notification on same bucket joins the group (count=2)', async () => {
