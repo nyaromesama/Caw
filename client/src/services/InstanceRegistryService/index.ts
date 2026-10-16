@@ -53,6 +53,13 @@ const InstanceRegistryConfig = z.object({
 })
 type InstanceRegistryConfig = z.infer<typeof InstanceRegistryConfig>
 
+// Max blocks per eth_getLogs window on L1. The 10K default suits most
+// providers; an operator whose L1 RPC caps eth_getLogs lower sets
+// L1_LOG_CHUNK_BLOCKS to that cap. Without it the cold scan fails on every
+// tick and the peer cache never becomes complete (see isPeerCacheComplete).
+// L1 counterpart of L2_LOG_CHUNK_BLOCKS in RawEventsGatherer.
+const L1_LOG_CHUNK_BLOCKS = Number(process.env.L1_LOG_CHUNK_BLOCKS) || 10_000
+
 // =====================================================================
 // Module-scoped peer cache. Shared across the process — `/api/instances`
 // reads it, redundant-broadcast helpers read it, etc. Keyed by networkId
@@ -76,6 +83,21 @@ export function getPeers(networkId: number): PeerInstance[] {
   const m = peerCache.get(networkId)
   if (!m) return []
   return [...m.values()].sort((a, b) => a.instanceId - b.instanceId)
+}
+
+// Networks whose cache has been built from a complete scan. Before that the
+// cache can hold a partial view: a scan that stopped on an RPC error can miss
+// an InstanceDeactivated, or an InstanceUpdated that rotated the validator
+// key, while the instance's registration is still there.
+const completeNetworks = new Set<number>()
+
+/**
+ * True once the peer cache for `networkId` has been built from a cold scan
+ * that reached the NetworkManager's deploy block without an RPC error.
+ * Checks that trust a peer's `active` / `validatorAddress` should wait for it.
+ */
+export function isPeerCacheComplete(networkId: number): boolean {
+  return completeNetworks.has(networkId)
 }
 
 // Resolved during selfRegister(); other modules read it via getOwnInstanceId
@@ -237,6 +259,9 @@ export async function refreshPeers(
   // Set true if the cold scan hit RPC errors and may be missing peers —
   // we then leave the cursor unset so the next tick retries a full scan.
   let scanIncomplete = false
+  // Highest block this call covers; the warm path below may stop short of
+  // latestBlock.
+  let scanTo = latestBlock
 
   if (isCold) {
     // Cold start: walk backward all the way to the NetworkManager deploy
@@ -294,12 +319,12 @@ export async function refreshPeers(
         return { added: [], changed: [], skipped: true }
       }
     }
-    // maxWindows must be large enough to span deploy→head at the default
-    // chunk size; size it from the actual range so the ceiling can't
-    // truncate the sparse history. stopOnEmptyWindow:false so a gap
+    // maxWindows must be large enough to span deploy→head at the
+    // configured chunk size; size it from the actual range so the ceiling
+    // can't truncate the sparse history. stopOnEmptyWindow:false so a gap
     // between registration clusters doesn't bail the walk early.
     const span = Math.max(0, latestBlock - managerDeployBlock)
-    const neededWindows = Math.ceil(span / 10_000) + 2
+    const neededWindows = Math.ceil(span / L1_LOG_CHUNK_BLOCKS) + 2
     // Spacing windows out (rather than firing eth_getLogs back-to-back as
     // fast as the RPC responds, measured at ~150ms apart) meaningfully
     // reduces the chance of self-inflicted rate limiting turning into a
@@ -325,6 +350,7 @@ export async function refreshPeers(
     // in-flight guard) rather than raising it alone.
     const allLogs = await scanLogsBackward(provider, clientManagerAddress, [allSigs], {
       fromBlock: managerDeployBlock,
+      chunkBlocks: L1_LOG_CHUNK_BLOCKS,
       stopOnEmptyWindow: false,
       maxWindows: neededWindows,
       delayMs: 50,
@@ -346,12 +372,16 @@ export async function refreshPeers(
   } else if (latestBlock > lastScannedBlock) {
     // Warm path: only scan blocks since last refresh. Cheap: 60s of
     // Sepolia is ~5 blocks, one getLogs call covers all four event
-    // types via the topic OR filter.
+    // types via the topic OR filter. Capped at L1_LOG_CHUNK_BLOCKS, so a
+    // node that fell far behind (refreshes failing for hours) catches up
+    // one chunk per tick instead of asking a capped RPC for a range it
+    // rejects every time.
+    scanTo = Math.min(latestBlock, lastScannedBlock + L1_LOG_CHUNK_BLOCKS)
     const incremental = await provider.getLogs({
       address: clientManagerAddress,
       topics: [allSigs],
       fromBlock: lastScannedBlock + 1,
-      toBlock: latestBlock,
+      toBlock: scanTo,
     })
     for (const log of incremental) {
       const t0 = (log.topics ?? [])[0]
@@ -367,7 +397,7 @@ export async function refreshPeers(
   // the cold scan hit RPC errors, keep it unset (cold) so the next tick
   // retries a full scan instead of switching to the cheap incremental path
   // over a truncated peer list.
-  if (!scanIncomplete) lastScannedBlock = latestBlock
+  if (!scanIncomplete) lastScannedBlock = scanTo
 
   const registered: any[] = []
   for (const log of regLogs) {
@@ -440,7 +470,17 @@ export async function refreshPeers(
   // same skipped signal means selfRegister's _lastRefreshSkipped guard
   // (which already exists for the resolution-failure case) covers this
   // one too, without selfRegister needing to know the difference.
+  if (!scanIncomplete) completeNetworks.add(networkId)
   return { ...applied, skipped: scanIncomplete }
+}
+
+/** Test-only hook. Back to the state of a fresh process. */
+export function _resetForTests(): void {
+  peerCache.clear()
+  completeNetworks.clear()
+  ownInstanceId = null
+  lastScannedBlock = -1
+  managerDeployBlock = -1
 }
 
 // =====================================================================
@@ -675,6 +715,7 @@ export const instanceRegistryService: Service = {
         networkId,
         apiUrl,
         peerCount: peerCache.get(networkId)?.size ?? 0,
+        peerCacheComplete: isPeerCacheComplete(networkId),
       }),
     }
   },
