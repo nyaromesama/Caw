@@ -18,6 +18,7 @@ import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { decompressActionText } from '../../utils/decompressActionText'
 import { groupERC1271Rows, estimateERC1271GroupBytes } from '../../utils/erc1271Groups'
+import { settleFailedERC1271Row } from '../../utils/erc1271Settle'
 import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
 import { getIndexerStats } from '../../utils/indexerHealth'
 import type { AbstractProvider } from 'ethers'
@@ -1424,8 +1425,9 @@ export const validatorService: Service = {
       const awaitingRows = await prisma.txQueue.findMany({
         where: { status: 'awaiting_indexer' },
         // signedTx is needed for markTxQueueValidatedByPeer → incrementSessionSpent
-        // (recovers signer to identify the session key to charge).
-        select: { id: true, payload: true, senderId: true, updatedAt: true, signedTx: true },
+        // (recovers signer to identify the session key to charge). ERC-1271
+        // rows (settleFailedERC1271Row) get no bump, as on their success path (L-2).
+        select: { id: true, payload: true, senderId: true, updatedAt: true, signedTx: true, signerKind: true },
       })
       if (awaitingRows.length > 0) {
         console.log(`[Validator] Rechecking ${awaitingRows.length} awaiting_indexer row(s)`)
@@ -1435,7 +1437,7 @@ export const validatorService: Service = {
           const resolution = await resolveCawonceUsed(data, row.updatedAt, httpProvider)
           if (resolution === 'done') {
             console.log(`[Validator] TxQueue ${row.id}: Action row now indexed and matches — marking done`)
-            await markTxQueueValidatedByPeer(row.id, row.payload, row.signedTx)
+            await markTxQueueValidatedByPeer(row.id, row.payload, row.signerKind === 'erc1271' ? null : row.signedTx)
             // Also mark the optimistic Caw row SUCCESS for caw/recaw actions, mirroring updateQueueStatuses.
             if (data.actionType === 0 || data.actionType === 'caw' || data.actionType === 3 || data.actionType === 'recaw') {
               await prisma.caw.update({
@@ -1522,7 +1524,8 @@ export const validatorService: Service = {
           (ex?.text ?? '') === dataTextPlain
         if (sameAction) {
           console.log(`[Validator] TxQueue ${candidate.id}: action already on chain (peer mirror submitted) — marking done without simulation`)
-          await markTxQueueValidatedByPeer(candidate.id, (candidate as any).payload, (candidate as any).signedTx)
+          // No session-spend bump for ERC-1271 rows (L-2).
+          await markTxQueueValidatedByPeer(candidate.id, (candidate as any).payload, (candidate as any).signerKind === 'erc1271' ? null : (candidate as any).signedTx)
           // Mirror the SUCCESS state to optimistic Caw rows so the FE
           // stops showing pending.
           if (data.actionType === 0 || data.actionType === 'caw' || data.actionType === 3 || data.actionType === 'recaw') {
@@ -1877,7 +1880,7 @@ export const validatorService: Service = {
         releaseSlot()
         console.log(`[submitERC1271Actions] MILESTONE: submit path done — sent ${erc1271Data.actions.length} action(s), tx=${tx.hash}`)
 
-        const receipt = await tx.wait()
+        const receipt = await waitForReceipt(tx, TX_WAIT_TIMEOUT_MS)
 
         const evt = receipt?.logs
           ?.map((log: any) => { try { return packedIface.parseLog(log) } catch { return null } })
@@ -2239,14 +2242,13 @@ export const validatorService: Service = {
     // 2026-05-13.
     let _submitChain: Promise<unknown> = Promise.resolve()
 
-    // Upper bound on submitProcessActions' receipt wait. 60 s is 30 Base
-    // blocks, and leaves room under the poll watchdog's 180 s floor
-    // (pollTimeoutMs) for the ERC-1271 sub-path that runs after it in the same
-    // poll, so a missing receipt no longer costs a service restart.
-    //
-    // submitERC1271Actions still waits without a bound: its caller marks every
-    // row failed on any error, so a timeout there would turn a slow tx that
-    // still lands into failed rows. It needs a cawonce check first.
+    // Upper bound on each submit's receipt wait (submitProcessActions and
+    // submitERC1271Actions). 60 s is 30 Base blocks. The ERC-1271 sub-path
+    // starts no group after the first once the poll has used half of
+    // pollTimeoutMs, so a group it does start finishes waiting by half + 60 s,
+    // under the watchdog's 180 s floor; without the bound one missing receipt
+    // held the poll until the watchdog restarted the service. A timed-out
+    // ERC-1271 group is settled by settleFailedERC1271Row.
     const TX_WAIT_TIMEOUT_MS = 60_000
 
     async function submitProcessActions(
@@ -4056,6 +4058,8 @@ console.log("succeededKeys", succeededKeys)
           const erc1271Bound = erc1271ToSend[gi]
           let erc1271Finalized: Array<{ senderId: number; cawonce: number }> = []
           let erc1271SubmitError: string | null = null
+          let erc1271Submitted = false
+          let erc1271TimedOut = false
           const erc1271Size = estimateERC1271GroupBytes(erc1271Bound)
           if (erc1271Size > MAX_ERC1271_CALLDATA_BYTES) {
             erc1271SubmitError = `Batch too large to submit (~${erc1271Size} bytes)`
@@ -4070,15 +4074,17 @@ console.log("succeededKeys", succeededKeys)
             })
 
             try {
+              erc1271Submitted = true
               const erc1271Result = await submitERC1271Actions(validatorId, erc1271Data, erc1271Quote)
               erc1271Finalized = erc1271Result.processed
             } catch (erc1271Err: any) {
               erc1271SubmitError = erc1271Err.message || 'ERC-1271 submission failed'
+              erc1271TimedOut = erc1271Err instanceof TxWaitTimeoutError
               console.error('[Validator] ERC-1271 submission failed:', erc1271SubmitError)
-              // L-1 known gap: unlike the ECDSA path there is NO bisect/recovery
-              // here. A single invalid action fails its whole group (one tx).
-              // If this becomes a reliability concern, add bisect similar to the
-              // ECDSA path (splitAndResubmit pattern). Tracked as a follow-up.
+              // L-1 known gap: unlike the ECDSA path there is NO bisect here.
+              // A single invalid action fails its whole group (one tx). Rows
+              // whose action is on chain anyway are settled below
+              // (settleFailedERC1271Row) instead of being marked failed.
             }
           }
 
@@ -4097,6 +4103,32 @@ console.log("succeededKeys", succeededKeys)
               // Only call it for session-key (non-erc1271) rows.
               if ((entry as any).signerKind !== 'erc1271') {
                 await incrementSessionSpent(prisma as any, entry.payload as any, entry.signedTx)
+              }
+            } else if (erc1271Submitted && erc1271SubmitError) {
+              const verdict = await settleFailedERC1271Row({
+                submitError: erc1271SubmitError,
+                timedOut: erc1271TimedOut,
+                isCawonceUsed: () => cawActions.isCawonceUsed(data.senderId, data.cawonce),
+                resolveCawonceUsed: () => resolveCawonceUsed(data, entry.updatedAt, httpProvider),
+              })
+              if (verdict.kind === 'landed') {
+                // signedTx null: no session-spend bump for ERC-1271 rows (L-2).
+                await markTxQueueValidatedByPeer(entry.id, entry.payload, null)
+                console.log(`[Validator] ERC-1271 TxQueue ${entry.id}: submit failed but the action is on chain — validated_by_peer`)
+              } else if (verdict.kind === 'awaiting_indexer') {
+                await prisma.txQueue.update({
+                  where: { id: entry.id },
+                  data: { status: 'awaiting_indexer', reason: 'awaiting Action indexer' },
+                })
+                console.log(`[Validator] ERC-1271 TxQueue ${entry.id}: cawonce ${data.cawonce} used but Action row not yet indexed — deferring`)
+              } else if (verdict.kind === 'pending') {
+                await prisma.txQueue.updateMany({
+                  where: { id: entry.id, status: 'processing' },
+                  data: { status: 'pending' },
+                })
+                console.log(`[Validator] ERC-1271 TxQueue ${entry.id}: receipt timed out and cawonce ${data.cawonce} is not used — back to pending`)
+              } else {
+                await markTxQueueFailed(entry.id, verdict.reason, data.senderId, data)
               }
             } else {
               const reason = erc1271SubmitError || 'ERC-1271 action not confirmed on chain'
