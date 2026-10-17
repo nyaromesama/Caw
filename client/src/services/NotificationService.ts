@@ -204,16 +204,22 @@ export async function repairNotificationGroups(
       WHERE g.type IN (${types})
         AND (g."targetKey" IS NULL OR g."targetKey" NOT LIKE 'n:%')
         AND NOT EXISTS (SELECT 1 FROM "Notification" n WHERE n."groupId" = g.id)`),
+    // Step 3 is a UNION rather than `isRead = false OR EXISTS (...)`: the
+    // OR keeps the EXISTS from becoming a semi join, and at the default
+    // work_mem (4MB) Postgres then rescans Notification once per group
+    // (no index on groupId). A join can hash in batches at any work_mem.
     client.$executeRawUnsafe(`
-      WITH dismissed AS (
-        SELECT g.id
+      WITH hidden_latest AS (
+        SELECT g.id, g."isRead"
         FROM "NotificationGroup" g
         JOIN "Notification" l ON l.id = g."latestNotificationId" AND l.hidden = true
-        WHERE g."isRead" = false
-           OR EXISTS (
-             SELECT 1 FROM "Notification" n
-             WHERE n."groupId" = g.id AND (n.hidden = false OR n."isRead" = false)
-           )
+      ), dismissed AS (
+        SELECT h.id FROM hidden_latest h WHERE h."isRead" = false
+        UNION
+        SELECT h.id
+        FROM hidden_latest h
+        JOIN "Notification" n ON n."groupId" = h.id
+        WHERE n.hidden = false OR n."isRead" = false
       ), members AS (
         UPDATE "Notification" n SET hidden = true, "isRead" = true
         FROM dismissed d WHERE n."groupId" = d.id
