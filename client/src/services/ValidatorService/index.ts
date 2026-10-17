@@ -17,7 +17,7 @@ import { waitForReceipt, TxWaitTimeoutError } from '../../utils/txWait'
 import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { decompressActionText } from '../../utils/decompressActionText'
-import { groupERC1271Rows, estimateERC1271GroupBytes } from '../../utils/erc1271Groups'
+import { groupERC1271Rows, estimateERC1271GroupBytes, canStartERC1271Group } from '../../utils/erc1271Groups'
 import { settleFailedERC1271Row } from '../../utils/erc1271Settle'
 import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
 import { getIndexerStats } from '../../utils/indexerHealth'
@@ -2243,13 +2243,22 @@ export const validatorService: Service = {
     let _submitChain: Promise<unknown> = Promise.resolve()
 
     // Upper bound on each submit's receipt wait (submitProcessActions and
-    // submitERC1271Actions). 60 s is 30 Base blocks. The ERC-1271 sub-path
-    // starts no group after the first once the poll has used half of
-    // pollTimeoutMs, so a group it does start finishes waiting by half + 60 s,
-    // under the watchdog's 180 s floor; without the bound one missing receipt
-    // held the poll until the watchdog restarted the service. A timed-out
-    // ERC-1271 group is settled by settleFailedERC1271Row.
+    // submitERC1271Actions). 60 s is 30 Base blocks. Without the bound one
+    // missing receipt held the poll until the watchdog restarted the
+    // service. The ERC-1271 sub-path starts a group only while this wait
+    // plus ERC1271_GROUP_MARGIN_MS still ends before the poll watchdog
+    // would fire (canStartERC1271Group). A timed-out ERC-1271 group is
+    // settled by settleFailedERC1271Row.
     const TX_WAIT_TIMEOUT_MS = 60_000
+    // Room for the rest of an ERC-1271 group besides the receipt wait: the
+    // quote, the gas estimate and send, and settling its rows
+    // (isCawonceUsed, and resolveCawonceUsed's calldata backstop for a row
+    // that has waited past the indexer budget). Not a hard bound: an RPC
+    // call that hangs still ends at the watchdog.
+    const ERC1271_GROUP_MARGIN_MS = 30_000
+    // When safePollLoop last sent the poll heartbeat. The watchdog counts
+    // from here, not from the start of the current poll.
+    let pollHeartbeatAt = Date.now()
 
     async function submitProcessActions(
       validatorId: number,
@@ -2966,7 +2975,6 @@ console.log("succeededKeys", succeededKeys)
 
     /** natstat: core polling loop */
     async function pollLoop() {
-      const pollStartedAt = Date.now()
       await refreshSettings(checkInterval)
       // Cheap metric — one max(createdAt) query — so resolveCawonceUsed
       // can size its budget to the indexer's actual lag rather than a
@@ -4023,14 +4031,14 @@ console.log("succeededKeys", succeededKeys)
         // reads a uint16 header per group, buildERC1271ActionData writes one
         // per tx, and the two agree only when the tx carries a single group.
         // A group is never split. Each group is a sequential send + wait, and
-        // the poll watchdog (pollTimeoutMs) restarts the service if one poll
-        // overruns, so groups go back to 'pending' for the next poll when
-        // they are past MAX_ERC1271_GROUPS_PER_POLL, or when the poll has
-        // used half of pollTimeoutMs (on slow blocks 8 waits alone can
-        // exceed it). The first group is always sent.
+        // the poll watchdog restarts the service if the poll loop goes
+        // declaredPollTimeoutMs without a heartbeat, so groups go back to
+        // 'pending' for the next poll when they are past
+        // MAX_ERC1271_GROUPS_PER_POLL, or when one more group would not end
+        // before the watchdog fires (canStartERC1271Group, checked before
+        // every group, the first one included).
         const MAX_ERC1271_CALLDATA_BYTES = 120_000
         const MAX_ERC1271_GROUPS_PER_POLL = 8
-        const erc1271TimeBudgetMs = pollTimeoutMs() / 2
         const erc1271Groups = groupERC1271Rows(validatedERC1271)
         const deferERC1271Groups = async (groups: typeof erc1271Groups, why: string) => {
           const deferred = groups.flat()
@@ -4048,10 +4056,17 @@ console.log("succeededKeys", succeededKeys)
         const erc1271ToSend = erc1271Groups.slice(0, MAX_ERC1271_GROUPS_PER_POLL)
 
         for (let gi = 0; gi < erc1271ToSend.length; gi++) {
-          if (gi > 0 && Date.now() - pollStartedAt > erc1271TimeBudgetMs) {
+          const roomForGroup = canStartERC1271Group({
+            now: Date.now(),
+            lastHeartbeatAt: pollHeartbeatAt,
+            watchdogTimeoutMs: declaredPollTimeoutMs,
+            receiptWaitMs: TX_WAIT_TIMEOUT_MS,
+            marginMs: ERC1271_GROUP_MARGIN_MS,
+          })
+          if (!roomForGroup) {
             await deferERC1271Groups(
               erc1271ToSend.slice(gi),
-              `ERC-1271 time budget (${Math.round(erc1271TimeBudgetMs / 1000)}s of the poll) used after ${gi} group(s)`,
+              `No time left before the poll watchdog (${Math.round(declaredPollTimeoutMs / 1000)}s since the last heartbeat) for another ERC-1271 group after ${gi} group(s)`,
             )
             break
           }
@@ -5925,6 +5940,7 @@ console.log("succeededKeys", succeededKeys)
           ctx.declareLoop('poll', wantPollTimeoutMs)
         }
         ctx.heartbeat('poll')
+        pollHeartbeatAt = Date.now()
       } catch (err) {
         console.error(err)
       } finally {

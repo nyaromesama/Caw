@@ -1,5 +1,5 @@
 import { expect } from 'chai'
-import { groupERC1271Rows, estimateERC1271GroupBytes } from '../../src/utils/erc1271Groups'
+import { groupERC1271Rows, estimateERC1271GroupBytes, canStartERC1271Group } from '../../src/utils/erc1271Groups'
 import { packActions, bytesToHex } from '../../src/utils/packActions'
 
 // CawActionsERC1271.processActionsERC1271 reads packedActions as one
@@ -127,5 +127,35 @@ describe('estimateERC1271GroupBytes', () => {
     r.payload.data.recipients = [5, 6]
     r.payload.data.amounts = ['1', '2', '3']
     expect(estimateERC1271GroupBytes([r])).to.equal(500 + 25 + 200 + 10 + 2 * 4 + 3 * 8)
+  })
+})
+
+describe('canStartERC1271Group', () => {
+  // A live checkInterval of 60 s: the watchdog allows max(4 * 60 s, 180 s)
+  // = 240 s between heartbeats, and the next poll starts 60 s after one.
+  const s = 1000
+  const base = { lastHeartbeatAt: 0, watchdogTimeoutMs: 240 * s, receiptWaitMs: 60 * s, marginMs: 30 * s }
+
+  it('starts a group while its wait and margin end before the watchdog', () => {
+    expect(canStartERC1271Group({ ...base, now: 60 * s })).to.equal(true)
+    expect(canStartERC1271Group({ ...base, now: 150 * s })).to.equal(true)
+  })
+
+  it('counts from the last heartbeat, not from the start of the poll', () => {
+    // 120 s into a poll that started 60 s after the heartbeat: the old
+    // half-of-the-timeout budget (120 s from the poll start) still allowed
+    // this group, and its 60 s wait would end at 240 s.
+    expect(canStartERC1271Group({ ...base, now: 180 * s })).to.equal(false)
+  })
+
+  it('holds the first group too, when the ECDSA phase used the poll', () => {
+    expect(canStartERC1271Group({ ...base, now: 151 * s })).to.equal(false)
+  })
+
+  it('uses the watchdog floor when checkInterval is short', () => {
+    // checkInterval 10 s: the timeout is the 180 s floor.
+    const floor = { ...base, watchdogTimeoutMs: 180 * s }
+    expect(canStartERC1271Group({ ...floor, now: 90 * s })).to.equal(true)
+    expect(canStartERC1271Group({ ...floor, now: 91 * s })).to.equal(false)
   })
 })

@@ -44,6 +44,29 @@ export function groupERC1271Rows<T extends { senderId: number; batchId?: number 
   return groups
 }
 
+/**
+ * Whether one more ERC-1271 group can start in this poll without running
+ * into the poll watchdog.
+ *
+ * The runServices watchdog restarts the validator when the poll loop has
+ * gone `watchdogTimeoutMs` without a heartbeat. It counts from the
+ * heartbeat at the end of the previous poll, not from the start of this
+ * one: the next poll starts a checkInterval after that heartbeat. A group
+ * needs its receipt wait (`receiptWaitMs`) plus `marginMs` for the quote,
+ * the send and settling its rows, so it starts only while all of that
+ * still ends before the watchdog would fire. This applies to the first
+ * group too: the ECDSA phase before it can already have used the poll.
+ */
+export function canStartERC1271Group(opts: {
+  now: number
+  lastHeartbeatAt: number
+  watchdogTimeoutMs: number
+  receiptWaitMs: number
+  marginMs: number
+}): boolean {
+  return opts.now + opts.receiptWaitMs + opts.marginMs <= opts.lastHeartbeatAt + opts.watchdogTimeoutMs
+}
+
 function hexByteLength(hex: string): number {
   return hex.startsWith('0x') ? (hex.length - 2) / 2 : hex.length / 2
 }
