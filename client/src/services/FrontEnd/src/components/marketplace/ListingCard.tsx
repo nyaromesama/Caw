@@ -177,7 +177,10 @@ const ListingCard: React.FC<{ listing: MarketplaceListing; showCancel?: boolean 
   const [settleQuoteFailed, setSettleQuoteFailed] = useState(false)
   useEffect(() => {
     setSettleQuoteFailed(false)
-    if (!canSettle || !listing.highestBidder) { setSettleSyncLzFee(null); return }
+    // Drop the previous quote before asking for a new one (another winner):
+    // the settle button stays disabled until this one is in.
+    setSettleSyncLzFee(null)
+    if (!canSettle || !listing.highestBidder) return
     let cancelled = false
     readContract(wagmiConfig, {
       address: CAW_NAME_QUOTER_ADDRESS,

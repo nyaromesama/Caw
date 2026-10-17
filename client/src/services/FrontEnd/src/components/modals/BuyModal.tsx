@@ -157,7 +157,10 @@ const BuyModal: React.FC = () => {
   const [syncQuoteFailed, setSyncQuoteFailed] = useState(false)
   useEffect(() => {
     setSyncQuoteFailed(false)
-    if (!isOpen || !listing || !buyer) { setSyncLzFee(null); return }
+    // Drop the previous quote before asking for a new one (another buyer
+    // or listing): the buy buttons stay disabled until this one is in.
+    setSyncLzFee(null)
+    if (!isOpen || !listing || !buyer) return
     let cancelled = false
     readContract(wagmiConfig, {
       address: CAW_NAME_QUOTER_ADDRESS,

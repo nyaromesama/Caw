@@ -126,7 +126,10 @@ const ViewOffersModal: React.FC = () => {
   const [acceptQuoteFailed, setAcceptQuoteFailed] = useState(false)
   useEffect(() => {
     setAcceptQuoteFailed(false)
-    if (!isOpen || !isOwner || !tokenId || !quoteOwner) { setAcceptSyncLzFee(null); return }
+    // Drop the previous quote before asking for a new one (another wallet
+    // or token): the accept buttons stay disabled until this one is in.
+    setAcceptSyncLzFee(null)
+    if (!isOpen || !isOwner || !tokenId || !quoteOwner) return
     let cancelled = false
     readContract(wagmiConfig, {
       address: CAW_NAME_QUOTER_ADDRESS,
