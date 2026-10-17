@@ -24,6 +24,7 @@ import { markTxQueueFailed as sharedMarkTxQueueFailed } from '../../utils/txQueu
 import { incrementSessionSpent } from '../../utils/sessionSpendTracker'
 import { span } from '../../utils/trace'
 import { requireValidatorSigner, type ValidatorSigner } from '../../utils/signer'
+import { zkExecutedBitmap, slotExecuted } from '../../utils/zkExecutedSlots'
 
 // ABI for the new packed-calldata CawActions functions
 const PACKED_ABI = [
@@ -440,6 +441,9 @@ async function backstopCawonceFromCalldata(
   rowAgeMs: number,
 ): Promise<'done' | 'failed'> {
   const eventSig = packedIface.getEvent('ActionsProcessed')!.topicHash
+  // processActionsWithZkSigs emits ActionsProcessedZk instead, on the same
+  // CawActions address. The ERC-1271 sibling has no ZK path.
+  const zkEventSig = packedIface.getEvent('ActionsProcessedZk')!.topicHash
   // Scan back only as far as the failing TxQueue row is old. Any action
   // landing this user's (senderId, cawonce) before that row was created
   // can't be the one we're chasing — it's either an older confirmed
@@ -465,7 +469,7 @@ async function backstopCawonceFromCalldata(
   const scanOpts = { fromBlock, toBlock: head, chunkBlocks, maxWindows: 8 }
   let logs
   try {
-    logs = await scanLogsBackward(provider, CAW_ACTIONS_ADDRESS, [eventSig], scanOpts)
+    logs = await scanLogsBackward(provider, CAW_ACTIONS_ADDRESS, [[eventSig, zkEventSig]], scanOpts)
   } catch (err) {
     console.warn(`[Validator] backstop: scanLogsBackward (ECDSA) failed — ${err instanceof Error ? err.message : String(err)}`)
     return 'failed'
@@ -490,10 +494,20 @@ async function backstopCawonceFromCalldata(
   // is the same regardless of how many ActionsProcessed events it emits.
   // Build a txHash → emitting contract address map so the decode dispatch
   // below can branch on which contract (ECDSA vs ERC-1271) produced each tx.
+  // txExecuted holds the ZK executed-slot bitmap (null for non-ZK batches).
   const txEmitter = new Map<string, string>()
+  const txExecuted = new Map<string, bigint | null>()
   for (const l of logs) {
     if (!txEmitter.has(l.transactionHash)) {
+      let bitmap: bigint | null
+      try {
+        bitmap = zkExecutedBitmap(l)
+      } catch {
+        console.warn(`[Validator] backstop: ActionsProcessedZk log in tx ${l.transactionHash} did not decode — skipping tx`)
+        continue
+      }
       txEmitter.set(l.transactionHash, (l.address as string).toLowerCase())
+      txExecuted.set(l.transactionHash, bitmap)
     }
   }
   const txHashes = Array.from(txEmitter.keys())
@@ -564,9 +578,13 @@ async function backstopCawonceFromCalldata(
       continue
     }
 
-    for (const a of unpacked) {
+    const executedBitmap = txExecuted.get(txHash) ?? null
+    for (let i = 0; i < unpacked.length; i++) {
+      const a = unpacked[i]
       if (Number(a.senderId) !== Number(payload.senderId)) continue
       if (Number(a.cawonce) !== Number(payload.cawonce)) continue
+      // A ZK-skipped slot didn't run, so it isn't what used the cawonce.
+      if (!slotExecuted(executedBitmap, i)) continue
       // Hit. Decompress the on-chain text and run the same match used
       // against local Action rows.
       const landedText = decompressActionText(a.text)
