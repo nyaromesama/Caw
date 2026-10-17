@@ -6,11 +6,13 @@ import {
   ACTIONS_PROCESSED_ZK_TOPIC,
   zkExecutedBitmap,
   slotExecuted,
+  executedSlotCount,
 } from '../../src/utils/zkExecutedSlots'
 
 // processActionsWithZkSigs reports the slots it ran in ActionsProcessedZk's
-// actionsExecutedBitmap and skips the rest. The indexer and the validator's
-// calldata backstop use these helpers to leave skipped slots out.
+// actionsExecutedBitmap and skips the rest. The indexer, the validator's
+// calldata backstop and the checkpoint reconstruction use these helpers to
+// leave skipped slots out.
 describe('zkExecutedSlots', () => {
   const contract = new Interface(cawActionsAbi as any)
 
@@ -58,5 +60,12 @@ describe('zkExecutedSlots', () => {
   it('throws on a ZK log whose data does not decode', () => {
     const log = zkLog(1n)
     expect(() => zkExecutedBitmap({ topics: log.topics, data: '0x1234' })).to.throw()
+  })
+
+  it('counts every slot of a non-ZK batch, and only the executed slots of a ZK batch', () => {
+    expect(executedSlotCount(null, 24)).to.equal(24)
+    expect(executedSlotCount(0b0101n, 4)).to.equal(2)
+    expect(executedSlotCount(0n, 4)).to.equal(0)
+    expect(executedSlotCount((1n << 256n) - 1n, 256)).to.equal(256)
   })
 })

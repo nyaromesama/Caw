@@ -24,7 +24,7 @@ import { markTxQueueFailed as sharedMarkTxQueueFailed } from '../../utils/txQueu
 import { incrementSessionSpent } from '../../utils/sessionSpendTracker'
 import { span } from '../../utils/trace'
 import { requireValidatorSigner, type ValidatorSigner } from '../../utils/signer'
-import { zkExecutedBitmap, slotExecuted } from '../../utils/zkExecutedSlots'
+import { zkExecutedBitmap, slotExecuted, executedSlotCount } from '../../utils/zkExecutedSlots'
 
 // ABI for the new packed-calldata CawActions functions
 const PACKED_ABI = [
@@ -4569,6 +4569,8 @@ console.log("succeededKeys", succeededKeys)
       // processedEvents items carry .address so the decode dispatch can branch on
       // which contract emitted the event (ECDSA vs ERC-1271 calldata shape).
       let processedEvents: any[] = []
+      // txHash → executed-slot bitmap, for txs that emitted ActionsProcessedZk.
+      const txZkBitmap = new Map<string, bigint>()
       let scannedActions = 0
       let toBlock = latestL2
 
@@ -4582,6 +4584,13 @@ console.log("succeededKeys", succeededKeys)
           fromBlock,
           toBlock,
         )
+        // processActionsWithZkSigs emits ActionsProcessedZk instead, from the
+        // same address. The ERC-1271 sibling has no ZK path.
+        const batchZk = await eventsContract.queryFilter(
+          eventsContract.filters.ActionsProcessedZk(networkId),
+          fromBlock,
+          toBlock,
+        )
         let batchERC1271: any[] = []
         if (eventsContractERC1271) {
           batchERC1271 = await eventsContractERC1271.queryFilter(
@@ -4590,15 +4599,24 @@ console.log("succeededKeys", succeededKeys)
             toBlock,
           )
         }
-        // Merge the two event streams for counting. The address field on each
+        // Merge the event streams for counting. The address field on each
         // event record identifies which contract emitted it.
-        const combined = [...batch, ...batchERC1271]
+        const combined = [...batch, ...batchZk, ...batchERC1271]
         for (const ev of combined) {
           const args: any = (ev as any).args
           if (!args) continue
+          let bitmap: bigint | null
+          try {
+            bitmap = zkExecutedBitmap(ev)
+          } catch {
+            console.error(`[Reconstruct] ActionsProcessedZk log in tx ${ev.transactionHash} did not decode`)
+            return null
+          }
+          if (bitmap !== null) txZkBitmap.set(ev.transactionHash, bitmap)
           // The new event carries actionCount directly; no payload decode needed.
+          // A ZK batch moves networkActionCount only by the slots it executed.
           const cnt = Number(args.actionCount ?? args[2] ?? 0)
-          scannedActions += cnt
+          scannedActions += executedSlotCount(bitmap, cnt)
         }
         processedEvents = [...combined, ...processedEvents]
         if (fromBlock === 0) break
@@ -4608,8 +4626,9 @@ console.log("succeededKeys", succeededKeys)
       if (processedEvents.length === 0) return null
 
       // Build a map from txHash → emitting contract address. A single tx calls
-      // exactly one entry point (processActions OR processActionsERC1271), so the
-      // mapping is 1:1. This is used below to select the correct calldata decoder.
+      // exactly one entry point (processActions, safeProcessActions,
+      // processActionsWithZkSigs OR processActionsERC1271), so the mapping is
+      // 1:1. This and txZkBitmap select the correct calldata decoder below.
       const txEmitter = new Map<string, string>()
       for (const ev of processedEvents) {
         const txHash: string = ev.transactionHash
@@ -4712,17 +4731,30 @@ console.log("succeededKeys", succeededKeys)
             })
           }
         } else {
-          // ---- ECDSA path (processActions / safeProcessActions) ----
+          // ---- ECDSA path (processActions / safeProcessActions / processActionsWithZkSigs) ----
+          // The ZK entry point takes packedActions and packedSigs at the same
+          // argument positions, in the same layout; each slot it executed
+          // folds its group's r into the chain, like the sig path.
+          const zkBitmap = txZkBitmap.get(txHash) ?? null
           let decoded: any
-          try {
-            decoded = packedIface.decodeFunctionData('processActions', tx.data)
-          } catch {
-            // May be safeProcessActions — same arg shape, different selector.
+          if (zkBitmap !== null) {
             try {
-              decoded = packedIface.decodeFunctionData('safeProcessActions', tx.data)
+              decoded = packedIface.decodeFunctionData('processActionsWithZkSigs', tx.data)
             } catch (err) {
-              console.error(`[Reconstruct] ECDSA calldata decode failed for tx ${txHash}: ${err instanceof Error ? err.message : String(err)}`)
+              console.error(`[Reconstruct] ZK calldata decode failed for tx ${txHash}: ${err instanceof Error ? err.message : String(err)}`)
               return null
+            }
+          } else {
+            try {
+              decoded = packedIface.decodeFunctionData('processActions', tx.data)
+            } catch {
+              // May be safeProcessActions — same arg shape, different selector.
+              try {
+                decoded = packedIface.decodeFunctionData('safeProcessActions', tx.data)
+              } catch (err) {
+                console.error(`[Reconstruct] ECDSA calldata decode failed for tx ${txHash}: ${err instanceof Error ? err.message : String(err)}`)
+                return null
+              }
             }
           }
           const packedHex: string = decoded[1]
@@ -4743,6 +4775,8 @@ console.log("succeededKeys", succeededKeys)
           for (let i = 0; i < unpackedActions.length; i++) {
             const a = unpackedActions[i]
             if (a.networkId !== networkId) continue
+            // A ZK-skipped slot changed no chain state (CawActions._zkApplyOne).
+            if (!slotExecuted(zkBitmap, i)) continue
             const sig = perActionSigs[i]
             orderedEntries.push({
               blockNumber: tx.blockNumber!,

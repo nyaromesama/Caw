@@ -34,3 +34,13 @@ export function zkExecutedBitmap(log: { topics: ReadonlyArray<string>; data: str
 export function slotExecuted(bitmap: bigint | null, i: number): boolean {
   return bitmap === null || (bitmap & (1n << BigInt(i))) !== 0n
 }
+
+/**
+ * How many of a batch's `actionCount` slots ran, which is how far the batch
+ * moved networkActionCount and the hash chain (null bitmap = all of them).
+ */
+export function executedSlotCount(bitmap: bigint | null, actionCount: number): number {
+  let n = 0
+  for (let i = 0; i < actionCount; i++) if (slotExecuted(bitmap, i)) n++
+  return n
+}
