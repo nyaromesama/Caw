@@ -4,6 +4,8 @@
  *   2. One xUserId can back at most one sponsored mint, however many tokens
  *      were issued for it (each OAuth round-trip issues a fresh token, and the
  *      callback's already-linked check only sees mints that have finished).
+ *   3. A reservation carries what an operator needs to clear it by hand, and
+ *      one whose mint tx was sent with an unknown outcome is kept.
  *
  * Redis and Prisma are in-memory stubs injected through the module's test
  * seams. The stub's multi().exec() runs its queue synchronously, which is the
@@ -38,6 +40,7 @@ class MockRedis {
 
   async set(key: string, value: string, ...args: any[]): Promise<'OK' | null> {
     if (args.includes('NX') && this.read(key) !== null) return null
+    if (args.includes('XX') && this.read(key) === null) return null
     this.store.set(key, { value })
     return 'OK'
   }
@@ -96,28 +99,48 @@ describe('X-signup spend guarantees', () => {
     const g2 = await xs.consumeXQualifiedToken(t2)
     expect(g1).to.not.equal(null)
     expect(g2).to.not.equal(null) // two distinct tokens: both consume fine
-    expect(await xs.reserveXSpend(g1.xUserId)).to.equal('ok')
-    expect(await xs.reserveXSpend(g2.xUserId)).to.equal('taken')
+    expect(await xs.reserveXSpend(g1.xUserId, 'alice')).to.equal('ok')
+    expect(await xs.reserveXSpend(g2.xUserId, 'alice')).to.equal('taken')
   })
 
   it('concurrent reservations for one xUserId: exactly one wins', async () => {
-    const r = await Promise.all([xs.reserveXSpend('42'), xs.reserveXSpend('42'), xs.reserveXSpend('42')])
+    const r = await Promise.all([xs.reserveXSpend('42', 'alice'), xs.reserveXSpend('42', 'alice'), xs.reserveXSpend('42', 'alice')])
     expect(r.filter((x: string) => x === 'ok')).to.have.length(1)
   })
 
   it('an xUserId already in WalletXLink is taken even with no Redis key', async () => {
     links.add('42')
-    expect(await xs.reserveXSpend('42')).to.equal('taken')
+    expect(await xs.reserveXSpend('42', 'alice')).to.equal('taken')
   })
 
   it('releasing after a failed mint lets the same xUserId reserve again', async () => {
-    expect(await xs.reserveXSpend('42')).to.equal('ok')
+    expect(await xs.reserveXSpend('42', 'alice')).to.equal('ok')
     await xs.releaseXSpend('42')
-    expect(await xs.reserveXSpend('42')).to.equal('ok')
+    expect(await xs.reserveXSpend('42', 'alice')).to.equal('ok')
   })
 
   it('reservations for different xUserIds do not interfere', async () => {
-    expect(await xs.reserveXSpend('42')).to.equal('ok')
-    expect(await xs.reserveXSpend('43')).to.equal('ok')
+    expect(await xs.reserveXSpend('42', 'alice')).to.equal('ok')
+    expect(await xs.reserveXSpend('43', 'alice')).to.equal('ok')
+  })
+  it('the reservation records the username, for an operator to check on chain', async () => {
+    expect(await xs.reserveXSpend('42', 'alice')).to.equal('ok')
+    const marker = JSON.parse((await redis.get('sponsor:xspent:42'))!)
+    expect(marker.username).to.equal('alice')
+    expect(marker.at).to.be.a('number')
+    expect(marker.txHash).to.equal(undefined)
+  })
+
+  it('a sent mint with an unknown outcome keeps the reservation and records the tx', async () => {
+    expect(await xs.reserveXSpend('42', 'alice')).to.equal('ok')
+    await xs.keepXSpendForSentTx('42', 'alice', '0xabc')
+    const marker = JSON.parse((await redis.get('sponsor:xspent:42'))!)
+    expect(marker).to.include({ username: 'alice', txHash: '0xabc' })
+    expect(await xs.reserveXSpend('42', 'bob')).to.equal('taken')
+  })
+
+  it('recording a tx does not create a reservation that was not there', async () => {
+    await xs.keepXSpendForSentTx('42', 'alice', '0xabc')
+    expect(await redis.get('sponsor:xspent:42')).to.equal(null)
   })
 })

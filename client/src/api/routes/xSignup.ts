@@ -123,21 +123,47 @@ export async function consumeXQualifiedToken(token: string): Promise<{ xUserId: 
 // account has not minted". The mint reserves the xUserId here before it runs.
 // No TTL: the WalletXLink row is the durable record, and this marker covers the
 // window before it lands and the case where that write fails after the mint.
+//
+// The marker fails closed: a crash between the reservation and the mint, or a
+// mint whose outcome is unknown, leaves the X account blocked rather than open
+// to a second mint. Its value is what an operator needs to unblock it by hand:
+//   { at, username }          reserved; no mint tx known
+//   { at, username, txHash }  the mint tx was sent, and its outcome is unknown
+// Safe to DEL only when there is no WalletXLink for the xUserId, the mint is
+// not on chain (the txHash has no receipt and the sponsor's nonce has moved
+// past it; without a txHash, CawProfileMinter.idByUsername(username) is 0
+// after long enough that no sent mint can still be pending).
 const SPENT_PREFIX = 'sponsor:xspent:'
 
+export interface XSpendMarker {
+  at: number
+  username: string
+  txHash?: string
+}
+
 /**
- * Reserve an xUserId for one sponsored mint. 'taken' if it is already linked
- * in WalletXLink or another mint holds the reservation. Throws on a Redis or
- * DB error; the caller must not mint in that case.
+ * Reserve an xUserId for one sponsored mint of `username`. 'taken' if it is
+ * already linked in WalletXLink or another mint holds the reservation. Throws
+ * on a Redis or DB error; the caller must not mint in that case.
  */
-export async function reserveXSpend(xUserId: string): Promise<'ok' | 'taken'> {
+export async function reserveXSpend(xUserId: string, username: string): Promise<'ok' | 'taken'> {
   const linked = await getPrisma().walletXLink.findUnique({
     where:  { xUserId },
     select: { xUserId: true },
   })
   if (linked) return 'taken'
-  const set = await getRedis().set(SPENT_PREFIX + xUserId, String(Date.now()), 'NX')
+  const marker: XSpendMarker = { at: Date.now(), username }
+  const set = await getRedis().set(SPENT_PREFIX + xUserId, JSON.stringify(marker), 'NX')
   return set ? 'ok' : 'taken'
+}
+
+/**
+ * Keep the reservation of a mint whose tx was sent but whose outcome is
+ * unknown, and record the tx on it. Only overwrites an existing marker.
+ */
+export async function keepXSpendForSentTx(xUserId: string, username: string, txHash: string): Promise<void> {
+  const marker: XSpendMarker = { at: Date.now(), username, txHash }
+  await getRedis().set(SPENT_PREFIX + xUserId, JSON.stringify(marker), 'XX')
 }
 
 /** Give back a reservation whose mint did not happen. */
