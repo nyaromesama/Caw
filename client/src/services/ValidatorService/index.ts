@@ -2235,9 +2235,10 @@ export const validatorService: Service = {
     let _submitChain: Promise<unknown> = Promise.resolve()
 
     // Upper bound on submitProcessActions' receipt wait. 60 s is 30 Base
-    // blocks, and leaves room under the poll watchdog's 180 s floor
-    // (pollTimeoutMs) for the ERC-1271 sub-path that runs after it in the same
-    // poll, so a missing receipt no longer costs a service restart.
+    // blocks, well under the poll watchdog's 180 s floor (pollTimeoutMs), so a
+    // missing receipt no longer costs a service restart. A timeout takes the
+    // transient branch, which returns from the poll before the ERC-1271
+    // sub-path, so ERC-1271 rows wait for the next poll.
     //
     // submitERC1271Actions still waits without a bound: its caller marks every
     // row failed on any error, so a timeout there would turn a slow tx that
