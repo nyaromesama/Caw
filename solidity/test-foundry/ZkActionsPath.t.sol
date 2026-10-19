@@ -14,6 +14,7 @@ pragma solidity ^0.8.22;
 //
 //   test_happyPath_allExecute               3 actions → bitmap 0b111, count +3
 //   test_verifierRejects_reverts            mock rejects → revert, cawonce unused
+//   test_verifierReceivesExpectedInputs     verifyProof gets the key, public values, proof
 //   test_signersLengthMismatch_reverts      2 actions, 1 signer → ZkSignersMismatch
 //   test_usedCawonce_skippedNotReverted     pre-used slot → bitmap 0b101, count +2
 //   test_signerMismatchInGroup_reverts      group of 2, two signers → SignerMismatch
@@ -117,7 +118,7 @@ contract ZkActionsPathTest is Test {
         actions = new CawActions(
             address(ledger),
             address(verifier),      // _zkVerifier
-            bytes32(uint256(0x11)), // _zkProgramVKey (the mock ignores it)
+            bytes32(uint256(0x11)), // _zkProgramVKey (the mock ignores it; test_verifierReceivesExpectedInputs pins it)
             address(0),             // _erc1271Sibling
             address(0),             // _capOracle
             0,                      // _bootstrapRatio
@@ -292,6 +293,30 @@ contract ZkActionsPathTest is Test {
         _zk(packed, _singleSigs(1), _signers(owner, 1));
 
         assertFalse(actions.isCawonceUsed(TOKEN_A, start), "cawonce consumed despite revert");
+    }
+
+    // The mock ignores its arguments, so the other tests pass whatever
+    // CawActions hands it. Pin the call itself: the constructor's key, the four
+    // public-value words and the proof bytes. This checks the wiring only, not
+    // anything about real SP1 proofs.
+    function test_verifierReceivesExpectedInputs() public {
+        uint32 start = uint32(actions.nextCawonce(TOKEN_A));
+        bytes memory packed  = _pack(_unfollow(start), _unfollow(start + 1));
+        bytes memory sigs    = _singleSigs(2);
+        bytes memory signers = _signers(owner, 2);
+
+        bytes memory publicValues = abi.encode(
+            keccak256(packed),
+            keccak256(sigs),
+            keccak256(signers),
+            actions.eip712DomainHash()
+        );
+        vm.expectCall(
+            address(verifier),
+            abi.encodeCall(ISP1Verifier.verifyProof, (bytes32(uint256(0x11)), publicValues, PROOF)),
+            1
+        );
+        _zk(packed, sigs, signers);
     }
 
     function test_signersLengthMismatch_reverts() public {
