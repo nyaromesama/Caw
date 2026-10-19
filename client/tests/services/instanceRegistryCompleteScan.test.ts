@@ -36,12 +36,15 @@ const chain = [
   log(35_000, 0, 'InstanceRegistered', [7, NETWORK_ID, key('7'), API_URL, key('b')]),
 ]
 
-function makeProvider(opts: { head: number; failAt?: number; calls?: [number, number][] }) {
+function makeProvider(opts: { head: number; failAt?: number; maxRange?: number; calls?: [number, number][] }) {
   return {
     async getBlockNumber() { return opts.head },
     async getCode(_addr: string, block: number) { return block >= 1_000 ? '0x60' : '0x' },
     async getLogs({ fromBlock, toBlock }: { fromBlock: number; toBlock: number }) {
       opts.calls?.push([fromBlock, toBlock])
+      if (opts.maxRange !== undefined && toBlock - fromBlock + 1 > opts.maxRange) {
+        throw new Error('range too large')
+      }
       if (opts.failAt !== undefined && fromBlock <= opts.failAt && opts.failAt <= toBlock) {
         throw new Error('rate limited')
       }
@@ -71,6 +74,26 @@ describe('InstanceRegistryService — complete scan', () => {
 
   it('becomes complete when the next cold scan reaches the deploy block', async () => {
     await refreshPeers(makeProvider({ head: 40_000, failAt: 25_000 }), MANAGER, NETWORK_ID)
+    const result = await refreshPeers(makeProvider({ head: 40_000 }), MANAGER, NETWORK_ID)
+    expect(result.skipped).to.equal(false)
+    expect(isPeerCacheComplete(NETWORK_ID)).to.equal(true)
+    const byId = new Map(getPeers(NETWORK_ID).map(p => [p.instanceId, p.active]))
+    expect([...byId]).to.deep.equal([[2, false], [7, true]])
+  })
+
+  it('stays incomplete when a window only came back through its upper half', async () => {
+    // A 6,000-block cap rejects every 10,000-block window and lets each upper
+    // half through, so the walk reaches the deploy block without a failed
+    // retry. The lower half of 1,000–10,000 (with instance 2's registration)
+    // was never fetched.
+    const result = await refreshPeers(makeProvider({ head: 40_000, maxRange: 6_000 }), MANAGER, NETWORK_ID)
+    expect(result.skipped).to.equal(true)
+    expect(isPeerCacheComplete(NETWORK_ID)).to.equal(false)
+    expect(getPeers(NETWORK_ID).map(p => p.instanceId)).to.deep.equal([7])
+  })
+
+  it('scans cold again after a scan that forfeited a lower half', async () => {
+    await refreshPeers(makeProvider({ head: 40_000, maxRange: 6_000 }), MANAGER, NETWORK_ID)
     const result = await refreshPeers(makeProvider({ head: 40_000 }), MANAGER, NETWORK_ID)
     expect(result.skipped).to.equal(false)
     expect(isPeerCacheComplete(NETWORK_ID)).to.equal(true)
