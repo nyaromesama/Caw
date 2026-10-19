@@ -160,6 +160,23 @@ async function applyToCache(
 }
 
 /**
+ * Logs sorted oldest → newest by (blockNumber, logIndex). The cold scan
+ * walks backward (scanLogsBackward returns newer windows first), so its
+ * logs are not in chain order; anything applied with "last write wins"
+ * has to be sorted first.
+ */
+export function inChainOrder<T>(logs: readonly T[]): T[] {
+  const pos = (l: any) => ({
+    block: Number(l.blockNumber),
+    index: Number(l.index ?? l.logIndex ?? 0),
+  })
+  return [...logs].sort((a, b) => {
+    const x = pos(a), y = pos(b)
+    return x.block !== y.block ? x.block - y.block : x.index - y.index
+  })
+}
+
+/**
  * Pull every InstanceRegistered + InstanceUpdated event for `networkId`
  * via the chunked log walker and apply them to the peer cache. Returns
  * the diff (added / changed) so callers can log new peers as they appear.
@@ -178,23 +195,6 @@ async function applyToCache(
  * oldest ones anyway. We therefore floor the cold walk at the
  * NetworkManager's deploy block and scan unconditionally down to it.
  */
-/**
- * Logs sorted oldest → newest by (blockNumber, logIndex). The cold scan
- * walks backward (scanLogsBackward returns newer windows first), so its
- * logs are not in chain order; anything applied with "last write wins"
- * has to be sorted first.
- */
-export function inChainOrder<T>(logs: readonly T[]): T[] {
-  const pos = (l: any) => ({
-    block: Number(l.blockNumber),
-    index: Number(l.index ?? l.logIndex ?? 0),
-  })
-  return [...logs].sort((a, b) => {
-    const x = pos(a), y = pos(b)
-    return x.block !== y.block ? x.block - y.block : x.index - y.index
-  })
-}
-
 // Highest block we've already scanned for instance-registry events.
 // Process-local cursor: on cold start we do a full backward scan to
 // find the contract's deploy block and all historical events; on
