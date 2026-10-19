@@ -14,6 +14,7 @@ import { buildCheckpointMerkleTree } from '../../utils/checkpointMerkle'
 import { tryClaimChallengeLock, releaseChallengeLock } from '../../utils/challengeLock'
 import { withWalletLock } from '../../utils/walletQueue'
 import { waitForReceipt, TxWaitTimeoutError } from '../../utils/txWait'
+import { InFlightTxs, actionKey } from '../../utils/inFlightTxs'
 import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { decompressActionText } from '../../utils/decompressActionText'
@@ -1542,7 +1543,27 @@ export const validatorService: Service = {
       // this function (bounded-batch builder + downstream sim) sees
       // only entries that still need work. `candidates` was declared
       // const above; rebind via a fresh let in this scope.
-      const remainingCandidates = dedupedCandidates
+      let remainingCandidates = dedupedCandidates
+
+      // Hold the actions of txs whose receipt wait timed out, until each tx
+      // has a receipt, its nonce is used, or the hold expires. Placed after
+      // the dedupe above so a tx that landed and got indexed settles its
+      // rows there first.
+      if (inFlightTxs.size > 0) {
+        const settled = await inFlightTxs.settle(httpProvider, signer.getAddress())
+        for (const { tx, reason } of settled) {
+          console.log(`[Validator] In-flight tx ${tx.hash} (nonce ${tx.nonce}, ${tx.keys.length} action(s)) settled: ${reason}`)
+        }
+        const held = inFlightTxs.heldKeys()
+        if (held.size > 0) {
+          const before = remainingCandidates.length
+          remainingCandidates = remainingCandidates.filter(c => {
+            const data = (c.payload as any)?.data
+            return !data || !held.has(actionKey(data.senderId, data.cawonce))
+          })
+          console.log(`[Validator] Holding ${before - remainingCandidates.length} row(s) for ${inFlightTxs.size} in-flight tx(s)`)
+        }
+      }
 
       // PARTITION: ERC-1271 (WebAuthn) rows must NEVER enter buildMultiActionData.
       // buildMultiActionData slices signedTx as a fixed 65-byte r/s/v structure;
@@ -2245,6 +2266,12 @@ export const validatorService: Service = {
     // still lands into failed rows. It needs a cawonce check first.
     const TX_WAIT_TIMEOUT_MS = 60_000
 
+    // Txs whose receipt wait timed out. fetchPendingQueue skips their
+    // actions until each one is settled, so a halted chain doesn't get the
+    // same rows sent again every poll (see utils/inFlightTxs).
+    const IN_FLIGHT_MAX_HOLD_MS = 10 * 60_000
+    const inFlightTxs = new InFlightTxs(IN_FLIGHT_MAX_HOLD_MS)
+
     async function submitProcessActions(
       validatorId: number,
       multiData: { actions: any[]; v: number[]; r: string[]; s: string[]; packedActions: string; packedSigs: string },
@@ -2414,7 +2441,8 @@ export const validatorService: Service = {
         // simulation then sees "Cawonce already used" for a tx that landed,
         // and resolveCawonceUsed settles those rows.
         if (err instanceof TxWaitTimeoutError) {
-          console.warn(`[submitProcessActions] ${err.message} — not re-sending; rows go back to pending`)
+          inFlightTxs.add(err.txHash, nonce, multiData.actions.map((a: any) => actionKey(a.senderId, a.cawonce)))
+          console.warn(`[submitProcessActions] ${err.message} — not re-sending; rows go back to pending, held until the tx settles (nonce ${nonce})`)
           throw err
         }
 
