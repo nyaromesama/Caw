@@ -14,9 +14,13 @@
 
 import { describe, it, afterEach } from 'mocha'
 import { expect } from 'chai'
+import { ethers } from 'ethers'
 import { _forTests, _setPrismaForTest } from '../../../src/services/SponsorRepayIndexer'
 
 const {
+  MINTER_ABI,
+  LEDGER_ABI,
+  eventNamesOf,
   makePollLoop,
   handleSponsorRepaySet,
   handleSponsorRepayRegistered,
@@ -86,6 +90,7 @@ describe('SponsorRepayIndexer poll loop', () => {
     const windows: Array<[number, number]> = []
     const saved: string[] = []
     const scheduled: Array<{ fn: () => void; ms: number }> = []
+    const beats: string[] = []
     let failWrites = true
 
     // Record the loop's next-poll timer instead of arming it.
@@ -96,6 +101,7 @@ describe('SponsorRepayIndexer poll loop', () => {
 
     const provider: any = { getBlockNumber: async () => 110 }
     const contract: any = {
+      interface: new ethers.Interface(MINTER_ABI as any),
       filters: { SponsorRepaySet: () => ({}) },
       queryFilter: async (_f: unknown, from: number, to: number) => {
         windows.push([from, to])
@@ -113,7 +119,9 @@ describe('SponsorRepayIndexer poll loop', () => {
       startBlock: 100,
       maxBlocks: 1000,
       pollMs: POLL_MS,
-      heartbeat: () => {},
+      backoffCapMs: 2 * POLL_MS,
+      heartbeat: () => { beats.push('ok') },
+      heartbeatDegraded: () => { beats.push('degraded') },
       alive: () => true,
       processEvents: async () => { if (failWrites) throw new Error('db down') },
     })
@@ -137,11 +145,31 @@ describe('SponsorRepayIndexer poll loop', () => {
     expect(saved).to.deep.equal([])
     expect(scheduled[1].ms).to.equal(2 * POLL_MS)
 
-    failWrites = false
+    // The third failure would wait 4x; the cap keeps it inside the watchdog timeout.
     scheduled[1].fn()
     await nextTick(3)
-    expect(windows[2]).to.deep.equal([101, 110])
+    expect(scheduled[2].ms).to.equal(2 * POLL_MS)
+    // Every failed poll still reports the loop alive (degraded), so the
+    // watchdog does not restart it while it backs off.
+    expect(beats).to.deep.equal(['degraded', 'degraded', 'degraded'])
+
+    failWrites = false
+    scheduled[2].fn()
+    await nextTick(4)
+    expect(windows[3]).to.deep.equal([101, 110])
     expect(saved).to.deep.equal(['110'])       // advances once the write lands
-    expect(scheduled[2].ms).to.equal(POLL_MS)
+    expect(scheduled[3].ms).to.equal(POLL_MS)
+    expect(beats[3]).to.equal('ok')
+  })
+})
+
+describe('SponsorRepayIndexer event names', () => {
+  it('lists every event of both ABIs from a real ethers Contract', () => {
+    const minter = new ethers.Contract(ethers.ZeroAddress, MINTER_ABI as any)
+    const ledger = new ethers.Contract(ethers.ZeroAddress, LEDGER_ABI as any)
+    expect(eventNamesOf(minter)).to.deep.equal(['SponsorRepaySet'])
+    expect(eventNamesOf(ledger)).to.deep.equal(['SponsorRepayRegistered', 'SponsorRepaySwept', 'SponsorRepayForgiven'])
+    // control: what the loop used before, which found no events to fetch
+    expect(Object.keys(ledger.filters)).to.deep.equal([])
   })
 })

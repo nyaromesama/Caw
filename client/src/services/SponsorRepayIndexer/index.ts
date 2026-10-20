@@ -231,10 +231,23 @@ async function handleSponsorRepayForgiven(args: ethers.Result): Promise<void> {
 // Poll loop factory — shared logic for L1 and L2 sides
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Cap for the retry backoff after failed polls (same as DepositWatcher):
-// pollMs, 2x, 4x, … up to 15 min, instead of re-polling every 250ms while a
-// held cursor keeps the loop "behind".
+// Cap for the retry backoff after failed polls: pollMs, 2x, 4x, … instead
+// of re-polling every 250ms while a held cursor keeps the loop "behind".
+// Each wait also stays under the loop's watchdog timeout (backoffCapMs in
+// start()), so a loop that is only backing off is not restarted as dead.
 const FAILURE_BACKOFF_CAP_MS = 15 * 60_000
+
+// Watchdog timeout for each poll loop (declareLoop).
+const loopTimeoutMs = (pollMs: number) => Math.max(pollMs * 3, 180_000)
+
+// Event names to poll, from the ABI. Object.keys(contract.filters) is [] for
+// an ethers v6 Contract (filters is a Proxy), which left the loop with no
+// events to fetch while it still advanced the checkpoint.
+function eventNamesOf(contract: ethers.Contract): string[] {
+  return contract.interface.fragments
+    .filter((f): f is ethers.EventFragment => f.type === 'event')
+    .map(f => f.name)
+}
 
 function makePollLoop(opts: {
   label:       string
@@ -245,7 +258,9 @@ function makePollLoop(opts: {
   startBlock:  number
   maxBlocks:   number
   pollMs:      number
+  backoffCapMs: number
   heartbeat:   (name?: string) => void
+  heartbeatDegraded: (name?: string, reason?: string) => void
   processEvents: (events: ethers.EventLog[]) => Promise<void>
   alive:       () => boolean
 }): { stop: () => void; start: () => void } {
@@ -261,8 +276,7 @@ function makePollLoop(opts: {
         const from = lastBlock + 1
         const to   = Math.min(current, from + opts.maxBlocks - 1)
 
-        const allFilters = opts.contract.filters
-        const eventNames = Object.keys(allFilters).filter(k => typeof allFilters[k] === 'function')
+        const eventNames = eventNamesOf(opts.contract)
 
         // Fetch all event types in parallel for this chunk. Deliberately NO
         // per-name .catch(() => []) here: swallowing a queryFilter failure to
@@ -300,11 +314,14 @@ function makePollLoop(opts: {
     } catch (err: any) {
       consecutiveFailures++
       console.error(`[${opts.label}] Poll error:`, err?.message || err)
+      // The loop ran but could not advance. Without a heartbeat here the
+      // watchdog restarted the service mid-backoff.
+      opts.heartbeatDegraded(opts.label, `poll failed ${consecutiveFailures}x: ${String(err?.message || err).slice(0, 120)}`)
     } finally {
       if (!opts.alive()) return
       let nextMs: number
       if (consecutiveFailures > 0) {
-        nextMs = Math.min(opts.pollMs * 2 ** (consecutiveFailures - 1), FAILURE_BACKOFF_CAP_MS)
+        nextMs = Math.min(opts.pollMs * 2 ** (consecutiveFailures - 1), opts.backoffCapMs)
       } else {
         const behind = lastBlock < (await opts.provider.getBlockNumber().catch(() => lastBlock))
         nextMs = behind ? 250 : opts.pollMs
@@ -320,6 +337,9 @@ function makePollLoop(opts: {
 }
 
 export const _forTests = {
+  MINTER_ABI,
+  LEDGER_ABI,
+  eventNamesOf,
   makePollLoop,
   handleSponsorRepaySet,
   handleSponsorRepayRegistered,
@@ -344,8 +364,11 @@ export const sponsorRepayIndexerService: Service = {
   start(configParam: unknown, ctx: import('../../Service').HeartbeatContext) {
     const cfg = Config.parse(configParam)
 
-    ctx.declareLoop('SponsorRepayIndexer:L1', Math.max(cfg.pollIntervalMs * 3, 180_000))
-    ctx.declareLoop('SponsorRepayIndexer:L2', Math.max(cfg.pollIntervalMs * 3, 180_000))
+    // Each loop is declared only when it runs: a declared loop that never
+    // heartbeats (no RPC or address for that chain) restarts the service.
+    const timeoutMs = loopTimeoutMs(cfg.pollIntervalMs)
+    // Leave one poll interval of the timeout for the poll itself.
+    const backoffCapMs = Math.min(FAILURE_BACKOFF_CAP_MS, timeoutMs - cfg.pollIntervalMs)
 
     const redis = new Redis(cfg.redisUrl)
 
@@ -369,6 +392,7 @@ export const sponsorRepayIndexerService: Service = {
 
         console.log(`[SponsorRepayIndexer:L1] Starting — minter=${minterAddress} chainId=${cfg.l1ChainId} fromBlock=${l1Start}`)
 
+        ctx.declareLoop('SponsorRepayIndexer:L1', timeoutMs)
         l1Loop = makePollLoop({
           label:    'SponsorRepayIndexer:L1',
           provider: l1Provider,
@@ -378,7 +402,9 @@ export const sponsorRepayIndexerService: Service = {
           startBlock: l1Start,
           maxBlocks: cfg.maxBlocksPerPoll,
           pollMs:   cfg.pollIntervalMs,
+          backoffCapMs,
           heartbeat: ctx.heartbeat,
+          heartbeatDegraded: ctx.heartbeatDegraded,
           alive:    () => isAlive,
           processEvents: async (events) => {
             for (const ev of events) {
@@ -407,6 +433,7 @@ export const sponsorRepayIndexerService: Service = {
 
         console.log(`[SponsorRepayIndexer:L2] Starting — ledger=${ledgerAddress} chainId=${cfg.l2ChainId} fromBlock=${l2Start}`)
 
+        ctx.declareLoop('SponsorRepayIndexer:L2', timeoutMs)
         l2Loop = makePollLoop({
           label:    'SponsorRepayIndexer:L2',
           provider: l2Provider,
@@ -416,7 +443,9 @@ export const sponsorRepayIndexerService: Service = {
           startBlock: l2Start,
           maxBlocks: cfg.maxBlocksPerPoll,
           pollMs:   cfg.pollIntervalMs,
+          backoffCapMs,
           heartbeat: ctx.heartbeat,
+          heartbeatDegraded: ctx.heartbeatDegraded,
           alive:    () => isAlive,
           processEvents: async (events) => {
             for (const ev of events) {
