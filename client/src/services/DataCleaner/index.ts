@@ -1207,6 +1207,8 @@ async function cleanupPendingSessionRegistrations() {
     // per group per tick. Keyed on the shared signature too, since batchId is
     // only a truncated timestamp.
     const batchGroupData = new Map<string, any[]>()
+    // Groups promoted this tick, so their other rows are not looked at again.
+    const promotedGroups = new Set<string>()
 
     for (const row of waitingRows) {
       try {
@@ -1238,8 +1240,12 @@ async function cleanupPendingSessionRegistrations() {
         // so the ActionBatch message can be rebuilt below. Outside the
         // signature try so a DB error retries next tick instead of failing.
         let groupData: any[] | null = null
-        if (hasActionBatch && row.batchId != null) {
-          const groupKey = `${row.senderId}:${row.batchId}:${row.signedTx}`
+        const groupKey = hasActionBatch && row.batchId != null
+          ? `${row.senderId}:${row.batchId}:${row.signedTx}`
+          : null
+        // Already promoted with the rest of its group earlier this tick.
+        if (groupKey != null && promotedGroups.has(groupKey)) continue
+        if (groupKey != null) {
           groupData = batchGroupData.get(groupKey) ?? null
           if (!groupData) {
             const groupRows = await prisma.txQueue.findMany({
@@ -1303,15 +1309,28 @@ async function cleanupPendingSessionRegistrations() {
         if (sessionValid) {
           // Session has landed on L2 — promote to pending so the validator
           // can simulate normally.
+          const promoted = {
+            status: 'pending',
+            pendingQuickSignTxHash: null,
+            reason: null,
+            // Back-fill implicitTip from the now-available SessionKey row.
+            implicitTip: sessionRow!.perActionTipRate ?? '0',
+          }
+          if (groupKey != null) {
+            // A batch group is promoted in one statement. Row by row, the
+            // validator could poll between two updates and submit part of
+            // the group, which recovers a different signer and reverts.
+            const { count } = await prisma.txQueue.updateMany({
+              where: { senderId: row.senderId, batchId: row.batchId, signedTx: row.signedTx, status: 'waiting_for_session' },
+              data: promoted,
+            })
+            promotedGroups.add(groupKey)
+            logger.log(`[PendingSession] TxQueue ${row.id} (sender ${row.senderId}): session landed — promoted batch ${row.batchId} (${count} row(s)) to pending`)
+            continue
+          }
           await prisma.txQueue.update({
             where: { id: row.id },
-            data: {
-              status: 'pending',
-              pendingQuickSignTxHash: null,
-              reason: null,
-              // Back-fill implicitTip from the now-available SessionKey row.
-              implicitTip: sessionRow!.perActionTipRate ?? '0',
-            }
+            data: promoted,
           })
           logger.log(`[PendingSession] TxQueue ${row.id} (sender ${row.senderId}): session landed — promoted to pending`)
           continue
