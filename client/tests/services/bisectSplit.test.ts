@@ -43,6 +43,28 @@ describe('splitAtBatchGroupBoundary', () => {
     expect(halves.map(ids)).to.deep.equal([[0, 1, 2], [3, 4]])
   })
 
+  // batchId alone can repeat (the API takes it from Date.now()), so the
+  // group is (sender, batchId, batch sig), as in buildMultiActionData.
+  const txRow = (id: number, senderId: number, batchId: number, signedTx: string) =>
+    ({ id, batchId, signedTx, payload: { data: { senderId } } })
+
+  it("splits two senders' batches that share a batchId", () => {
+    const rs = [txRow(0, 10, 777, '0xaaa'), txRow(1, 10, 777, '0xaaa'), txRow(2, 20, 777, '0xbbb'), txRow(3, 20, 777, '0xbbb')]
+    const halves = splitAtBatchGroupBoundary(rs)!
+    expect(halves.map(h => h.map(r => r.id))).to.deep.equal([[0, 1], [2, 3]])
+  })
+
+  it("splits one sender's two batches that share a batchId", () => {
+    const rs = [txRow(0, 10, 777, '0xaaa'), txRow(1, 10, 777, '0xaaa'), txRow(2, 10, 777, '0xccc')]
+    const halves = splitAtBatchGroupBoundary(rs)!
+    expect(halves.map(h => h.map(r => r.id))).to.deep.equal([[0, 1], [2]])
+  })
+
+  it('keeps one batch whole when its sender and sig match', () => {
+    const rs = [txRow(0, 10, 777, '0xaaa'), txRow(1, 10, 777, '0xaaa'), txRow(2, 10, 777, '0xaaa')]
+    expect(splitAtBatchGroupBoundary(rs)).to.equal(null)
+  })
+
   it('returns null for a single row', () => {
     expect(splitAtBatchGroupBoundary(singles(1))).to.equal(null)
   })
