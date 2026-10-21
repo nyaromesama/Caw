@@ -99,6 +99,21 @@ describe('InFlightTxs', () => {
     expect(f.size).to.equal(1)
   })
 
+  // A hung RPC call must not stall the poll past the watchdog: each check
+  // gives up after callTimeoutMs and keeps the hold, as for an RPC error.
+  it('keeps the holds when the chain does not answer within callTimeoutMs', async () => {
+    const f = new InFlightTxs(MAX, now, 20)
+    f.add('0xa', 7, ['5-1'])
+    const hung: InFlightChain = {
+      getTransactionReceipt: () => new Promise(() => {}),
+      getTransactionCount: () => new Promise(() => {}),
+    }
+    const started = Date.now()
+    expect(await f.settle(hung, ADDR)).to.deep.equal([])
+    expect(Date.now() - started).to.be.below(1000)
+    expect(f.size).to.equal(1)
+  })
+
   it('settles each tx on its own', async () => {
     const f = new InFlightTxs(MAX, now)
     f.add('0xa', 7, ['5-1'])          // landed

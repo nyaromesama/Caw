@@ -14,7 +14,8 @@
  *   - maxHoldMs has passed: a tx dropped from the mempool would otherwise
  *     hold its rows forever. A long halt then costs one re-send per
  *     maxHoldMs instead of one per poll.
- * An RPC error while checking keeps the hold.
+ * An RPC error, or a check that takes longer than callTimeoutMs, keeps the
+ * hold, so a slow RPC can't stall the validator poll.
  *
  * In memory only: a restart forgets the holds and the next poll may send
  * the rows once more, as before.
@@ -44,7 +45,16 @@ export class InFlightTxs {
   constructor(
     private readonly maxHoldMs: number,
     private readonly now: () => number = Date.now,
+    private readonly callTimeoutMs: number = 10_000,
   ) {}
+
+  private bounded<T>(call: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`in-flight check timeout after ${this.callTimeoutMs}ms`)), this.callTimeoutMs)
+    })
+    return Promise.race([call, deadline]).finally(() => clearTimeout(timer))
+  }
 
   add(hash: string, nonce: number, keys: string[]): void {
     this.txs = this.txs.filter(t => t.hash !== hash)
@@ -69,7 +79,7 @@ export class InFlightTxs {
         continue
       }
       try {
-        if (await chain.getTransactionReceipt(tx.hash)) {
+        if (await this.bounded(chain.getTransactionReceipt(tx.hash))) {
           settled.push({ tx, reason: 'receipt' })
           continue
         }
@@ -79,7 +89,7 @@ export class InFlightTxs {
     if (open.length > 0) {
       let mined: number | null = null
       try {
-        mined = await chain.getTransactionCount(address, 'latest')
+        mined = await this.bounded(chain.getTransactionCount(address, 'latest'))
       } catch { /* keep the holds */ }
       for (let i = open.length - 1; i >= 0; i--) {
         // 'latest' count = nonces 0..count-1 are mined.
