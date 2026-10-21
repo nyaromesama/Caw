@@ -161,6 +161,74 @@ describe('SponsorRepayIndexer poll loop', () => {
     expect(scheduled[3].ms).to.equal(POLL_MS)
     expect(beats[3]).to.equal('ok')
   })
+
+  it('retries a failed checkpoint save even when the head has not moved', async () => {
+    const POLL_MS = 60_000
+    const windows: Array<[number, number]> = []
+    const saved: string[] = []
+    const scheduled: Array<{ fn: () => void; ms: number }> = []
+    const beats: string[] = []
+    let failSave = true
+
+    ;(global as any).setTimeout = (fn: () => void, ms: number) => {
+      scheduled.push({ fn, ms })
+      return 0 as any
+    }
+
+    const provider: any = { getBlockNumber: async () => 110 }  // head stays at 110
+    const contract: any = {
+      interface: new ethers.Interface(MINTER_ABI as any),
+      filters: { SponsorRepaySet: () => ({}) },
+      queryFilter: async (_f: unknown, from: number, to: number) => {
+        windows.push([from, to])
+        return []
+      },
+    }
+    const redis: any = {
+      set: async (_k: string, v: string) => {
+        if (failSave) throw new Error('READONLY')
+        saved.push(v)
+      },
+    }
+
+    const loop = makePollLoop({
+      label: 'test',
+      provider,
+      contract,
+      redis,
+      cpKey: 'k',
+      startBlock: 100,
+      maxBlocks: 1000,
+      pollMs: POLL_MS,
+      backoffCapMs: 2 * POLL_MS,
+      heartbeat: () => { beats.push('ok') },
+      heartbeatDegraded: () => { beats.push('degraded') },
+      alive: () => true,
+      processEvents: async () => {},
+    })
+
+    const nextTick = async (n: number) => {
+      for (let i = 0; i < 200 && scheduled.length < n; i++) {
+        await new Promise(r => setImmediate(r))
+      }
+      expect(scheduled.length).to.equal(n)
+    }
+
+    loop.start()
+    await nextTick(1)
+    expect(windows).to.deep.equal([[101, 110]])
+    expect(saved).to.deep.equal([])
+    expect(beats).to.deep.equal(['degraded'])
+
+    failSave = false
+    scheduled[0].fn()
+    await nextTick(2)
+    // The cursor did not move on the failed save, so the same window is
+    // read again and this time the checkpoint lands.
+    expect(windows).to.deep.equal([[101, 110], [101, 110]])
+    expect(saved).to.deep.equal(['110'])
+    expect(beats[1]).to.equal('ok')
+  })
 })
 
 describe('SponsorRepayIndexer event names', () => {

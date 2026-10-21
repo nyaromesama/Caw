@@ -306,8 +306,11 @@ function makePollLoop(opts: {
           await opts.processEvents(merged)
         }
 
-        lastBlock = to
+        // Move the cursor only once the checkpoint is saved. If the save
+        // fails, the window is re-read and the save retried next poll, even
+        // when the chain head hasn't moved.
         await saveCheckpoint(opts.redis, opts.cpKey, to)
+        lastBlock = to
       }
       consecutiveFailures = 0
       opts.heartbeat(opts.label)
