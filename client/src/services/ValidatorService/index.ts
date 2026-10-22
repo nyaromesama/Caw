@@ -446,23 +446,49 @@ async function backstopCawonceFromCalldata(
   // action that's already in our local Action table (so resolveCawonceUsed
   // wouldn't have reached the backstop), or a stale-cawonce-allocator
   // collision we DON'T want to claim as ours. A pad multiplier covers
-  // clock skew + slow blocks; capped by maxWindows below.
+  // clock skew + slow blocks.
   //
-  // Base Sepolia: 2s nominal block time. Pad ×3 for safety.
-  const NOMINAL_BLOCK_MS = 2000
+  // The age → block-count conversion uses the provider's measured block
+  // time (blocksForDuration) rather than a hardcoded one. This used to
+  // assume Base Sepolia's 2s blocks; Base Sepolia moved to 200ms blocks on
+  // 2026-10-22, which silently shrank the scan to ~0.3× the row's age and
+  // let a peer-landed action older than that come back 'failed'.
+  // Pad ×3 for safety (on top of blocksForDuration's own margin).
   const PAD = 3
+  // Floor the window at 100s of chain time so a row created seconds before
+  // the resolve still gets a usable window — block timestamps and DB clocks
+  // aren't perfectly synced and rowAgeMs near zero would otherwise produce
+  // a 0-block scan. (Previously 50 blocks, i.e. 100s at 2s blocks.)
+  const MIN_SCAN_SECONDS = 100
+  // Ceiling at 2h of chain time. rowAgeMs runs from the row's createdAt, so
+  // a row that sat in waiting_for_deposit for days would otherwise ask for
+  // millions of blocks — and with maxWindows derived from the span below,
+  // thousands of eth_getLogs calls on an RPC budget shared with the rest
+  // of the node.
+  const MAX_SCAN_SECONDS = 2 * 60 * 60
   const head = await provider.getBlockNumber()
-  // Floor at 50 blocks so a row created seconds before the resolve still
-  // gets a usable window — block timestamps and DB clocks aren't perfectly
-  // synced and rowAgeMs near zero would otherwise produce a 0-block scan.
-  const targetSpan = Math.max(50, Math.ceil((rowAgeMs / NOMINAL_BLOCK_MS) * PAD))
+  const minSpan = await blocksForDuration(provider, MIN_SCAN_SECONDS)
+  const maxSpan = await blocksForDuration(provider, MAX_SCAN_SECONDS)
+  const wantedSpan = Math.max(minSpan, (await blocksForDuration(provider, rowAgeMs / 1000)) * PAD)
+  if (wantedSpan > maxSpan) {
+    console.log(`[Validator] backstop: (sender=${payload.senderId}, cawonce=${payload.cawonce}) row age ${Math.round(rowAgeMs / 1000)}s wants ${wantedSpan} blocks — capped at ${maxSpan} (${MAX_SCAN_SECONDS}s)`)
+  }
+  const targetSpan = Math.min(wantedSpan, maxSpan)
   const fromBlock = Math.max(0, head - targetSpan)
 
   // chunkBlocks shares the RawEventsGatherer L2_LOG_CHUNK_BLOCKS knob so a
   // capped-RPC operator (e.g. sepolia.base.org 2000-block eth_getLogs cap)
-  // bounds this scan too. Default 10K suits Infura/Alchemy.
+  // bounds this scan too. Default 10K suits Infura/Alchemy. maxWindows is
+  // derived from the span so a capped chunk size can't truncate the walk
+  // short of fromBlock (a fixed 8 × 1500 = 12K blocks is only ~40 min at
+  // 200ms blocks, less than the 60-min awaiting-indexer ceiling × PAD).
+  // stopOnEmptyWindow:false because fromBlock already bounds the walk: with
+  // the default early-bail, one quiet window (a single 1500-block chunk is
+  // only 5 min at 200ms blocks) after the most recent batch would end the
+  // scan before it reached the slot we're looking for.
   const chunkBlocks = Number(process.env.L2_LOG_CHUNK_BLOCKS) || 10_000
-  const scanOpts = { fromBlock, toBlock: head, chunkBlocks, maxWindows: 8 }
+  const maxWindows = Math.max(8, Math.ceil(targetSpan / chunkBlocks))
+  const scanOpts = { fromBlock, toBlock: head, chunkBlocks, maxWindows, stopOnEmptyWindow: false }
   let logs
   try {
     logs = await scanLogsBackward(provider, CAW_ACTIONS_ADDRESS, [eventSig], scanOpts)
@@ -645,6 +671,7 @@ async function resolveCawonceUsed(
   data: any,
   firstSeenAt: Date | undefined,
   provider: AbstractProvider,
+  rowCreatedAt?: Date,
 ): Promise<'done' | 'failed' | 'awaiting_indexer'> {
   const existingAction = await prisma.action.findFirst({
     where: { senderId: data.senderId, cawonce: data.cawonce }
@@ -719,12 +746,18 @@ async function resolveCawonceUsed(
   // TxQueue row's age — searching older history risks claiming an
   // unrelated old (senderId, cawonce) match as ours (would happen only
   // if the cawonce allocator misfired and re-used a long-confirmed slot;
-  // we should mark that failed, not done). rowAgeMs is undefined when
-  // firstSeenAt is missing — fall back to a sensible default that's
-  // larger than typical validator latency but small enough to keep the
-  // scan cheap.
-  const rowAgeMs = firstSeenAt
-    ? Math.max(0, Date.now() - firstSeenAt.getTime())
+  // we should mark that failed, not done). The age is measured from the
+  // row's createdAt, not firstSeenAt: firstSeenAt is the row's updatedAt,
+  // which on the awaiting_indexer re-check is when the row ENTERED
+  // awaiting_indexer — but the action we're looking for had already landed
+  // before that (the simulate that sent us here said the cawonce was used),
+  // so a window anchored there can end short of it. firstSeenAt still
+  // drives the budget check above. If neither is known, fall back to a
+  // sensible default that's larger than typical validator latency but
+  // small enough to keep the scan cheap.
+  const ageAnchor = rowCreatedAt ?? firstSeenAt
+  const rowAgeMs = ageAnchor
+    ? Math.max(0, Date.now() - ageAnchor.getTime())
     : 60_000
   return backstopCawonceFromCalldata(provider, data, rowAgeMs)
 }
@@ -1423,14 +1456,14 @@ export const validatorService: Service = {
         where: { status: 'awaiting_indexer' },
         // signedTx is needed for markTxQueueValidatedByPeer → incrementSessionSpent
         // (recovers signer to identify the session key to charge).
-        select: { id: true, payload: true, senderId: true, updatedAt: true, signedTx: true },
+        select: { id: true, payload: true, senderId: true, createdAt: true, updatedAt: true, signedTx: true },
       })
       if (awaitingRows.length > 0) {
         console.log(`[Validator] Rechecking ${awaitingRows.length} awaiting_indexer row(s)`)
         await Promise.all(awaitingRows.map(async (row) => {
           const data = (row.payload as any)?.data
           if (!data) return
-          const resolution = await resolveCawonceUsed(data, row.updatedAt, httpProvider)
+          const resolution = await resolveCawonceUsed(data, row.updatedAt, httpProvider, row.createdAt)
           if (resolution === 'done') {
             console.log(`[Validator] TxQueue ${row.id}: Action row now indexed and matches — marking done`)
             await markTxQueueValidatedByPeer(row.id, row.payload, row.signedTx)
@@ -2700,7 +2733,7 @@ export const validatorService: Service = {
           // only a genuine no-such-action gets the Bisected revert failure.
           const entry = entries[0]
           const data = (entry.payload as any).data
-          const resolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider)
+          const resolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider, entry.createdAt)
           if (resolution === 'done') {
             await markTxQueueValidatedByPeer(entry.id, (entry as any).payload, (entry as any).signedTx)
             verdictByEntryId.set(entry.id, { succeeded: true })
@@ -2761,7 +2794,7 @@ console.log("succeededKeys", succeededKeys)
         const cawonceUsed = rejection.includes('Cawonce already used')
         let cawonceResolution: 'done' | 'failed' | 'awaiting_indexer' | null = null
         if (cawonceUsed) {
-          cawonceResolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider)
+          cawonceResolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider, entry.createdAt)
           if (cawonceResolution === 'failed') {
             console.log(`[Validator] TxQueue ${entry.id}: Cawonce ${data.cawonce} used by DIFFERENT action — marking failed`)
           } else if (cawonceResolution === 'awaiting_indexer') {
@@ -3115,7 +3148,7 @@ console.log("succeededKeys", succeededKeys)
                   const cawonceUsed = rejection.includes('Cawonce already used')
                   let cawonceResolution: 'done' | 'failed' | 'awaiting_indexer' | null = null
                   if (cawonceUsed) {
-                    cawonceResolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider)
+                    cawonceResolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider, entry.createdAt)
                   }
                   const processedByOther = cawonceResolution === 'done'
 
@@ -3326,7 +3359,7 @@ console.log("succeededKeys", succeededKeys)
           console.log("[Validator] All actions rejected with 'Cawonce already used' — checking Action table...")
           await Promise.all(validatedEntries.map(async (entry: any) => {
             const data = (entry.payload as any).data
-            const resolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider)
+            const resolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider, entry.createdAt)
             if (resolution === 'done') {
               console.log(`[Validator] TxQueue ${entry.id}: Same action exists for senderId=${data.senderId} cawonce=${data.cawonce} — marking done`)
               await markTxQueueValidatedByPeer(entry.id, entry.payload, entry.signedTx)
@@ -3417,7 +3450,7 @@ console.log("succeededKeys", succeededKeys)
             const isCawonceUsed = rejection.includes('Cawonce already used')
 
             if (isCawonceUsed) {
-              const resolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider)
+              const resolution = await resolveCawonceUsed(data, entry.updatedAt, httpProvider, entry.createdAt)
               if (resolution === 'done') {
                 console.log(`[Validator] TxQueue ${entry.id}: Same action exists for senderId=${data.senderId} cawonce=${data.cawonce} — marking done`)
                 await markTxQueueValidatedByPeer(entry.id, entry.payload, (entry as any).signedTx)
