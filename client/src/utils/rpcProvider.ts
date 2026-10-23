@@ -673,6 +673,20 @@ export async function makeVerifiedWebSocketProvider(url: string, expectedChainId
   return provider
 }
 
+/**
+ * Like makeResilientHttpProvider (below) but probes every URL's chainId once
+ * first. Without it the first provider a resilient handle serves is never
+ * checked: only rebuilds verify-before-promote.
+ */
+export async function makeVerifiedResilientHttpProvider(
+  urls: string[],
+  chainId: number,
+  opts?: { label?: string },
+): Promise<ResilientProvider> {
+  await verifyChainIdAll(urls, chainId)
+  return makeResilientHttpProvider(urls, chainId, opts)
+}
+
 // ============================================
 // RESILIENT PROVIDER (auto-heal on dead connection)
 // ============================================

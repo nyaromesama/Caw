@@ -13,7 +13,7 @@ import { AddressInfo } from 'net'
 import { WebSocketServer } from 'ws'
 import {
   makeVerifiedJsonRpcProvider, makeVerifiedFallbackJsonRpcProvider,
-  makeVerifiedWebSocketProvider, makeResilientHttpProvider,
+  makeVerifiedWebSocketProvider, makeResilientHttpProvider, makeVerifiedResilientHttpProvider,
 } from '../../src/utils/rpcProvider'
 
 const SEPOLIA = 11155111
@@ -152,5 +152,23 @@ describe('rpcProvider — chain id verification', function () {
     promoted.reportError(new Error('socket hang up'))
     await new Promise(r => setTimeout(r, 1_000))
     expect(promoted.get()).to.not.equal(old)
+  })
+
+  it('makeVerifiedResilientHttpProvider probes every URL before the first provider is served', async () => {
+    const s0 = sepolia.counter.n, m0 = mainnet.counter.n
+    expect(await rejectionOf(makeVerifiedResilientHttpProvider([sepolia.url, mainnet.url], SEPOLIA, { label: 'test' })))
+      .to.match(/^ChainIdMismatchError: expected 11155111 got 1 /)
+    expect(sepolia.counter.n - s0).to.equal(1)
+    expect(mainnet.counter.n - m0).to.equal(1)
+
+    const ok = await makeVerifiedResilientHttpProvider([sepolia.url, sepolia.url], SEPOLIA, { label: 'test' })
+    expect(ok.get()).to.not.equal(undefined)
+    ok.destroy()
+  })
+
+  it('makeVerifiedResilientHttpProvider tolerates a failed probe with a warning', async () => {
+    const ok = await makeVerifiedResilientHttpProvider([sepolia.url, broken.url], SEPOLIA, { label: 'test' })
+    expect(warnings.some(w => w.includes('chain-ID probe failed'))).to.equal(true)
+    ok.destroy()
   })
 })
