@@ -29,6 +29,19 @@ export function buildPeerUrl(apiUrl: string, path: string): string {
   return target.toString()
 }
 
+/**
+ * What relayTargets compares: the URL with trailing dots taken off the
+ * hostname. "a.example." is the same host as "a.example" (the absolute
+ * form of the name), but new URL() keeps the dot, so without this an
+ * entry on "https://a.example." would get a second POST to the same
+ * server. Only the key changes; the URL that is fetched is left as is.
+ */
+function targetKey(url: string): string {
+  const u = new URL(url)
+  u.hostname = u.hostname.replace(/\.+$/, '')
+  return u.toString()
+}
+
 export interface RelayTarget {
   instanceId: number
   apiUrl: string
@@ -58,7 +71,7 @@ export function relayTargets(
   const own = peers.find(p => p.instanceId === ownInstanceId)
   if (own) {
     try {
-      seen.add(buildPeerUrl(own.apiUrl, path))
+      seen.add(targetKey(buildPeerUrl(own.apiUrl, path)))
     } catch {
       // Our own apiUrl doesn't parse; nothing to exclude by URL.
     }
@@ -74,8 +87,9 @@ export function relayTargets(
       console.warn(`[DmRelay] Skipping peer ${peer.instanceId} — invalid apiUrl: ${urlErr.message}`)
       continue
     }
-    if (seen.has(url)) continue
-    seen.add(url)
+    const key = targetKey(url)
+    if (seen.has(key)) continue
+    seen.add(key)
     targets.push({ instanceId: peer.instanceId, apiUrl: peer.apiUrl, url })
   }
   return targets

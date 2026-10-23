@@ -41,6 +41,30 @@ describe('relayTargets — one relay POST per peer URL', () => {
     ])
   })
 
+  it('treats a trailing dot on the hostname as the same URL, fetching the first spelling', () => {
+    const peers = [
+      peer(1, 'https://self.example'),
+      peer(2, 'https://a.example.'),
+      peer(3, 'https://a.example'),
+      peer(4, 'https://A.EXAMPLE..'),
+      peer(5, 'https://a.example.:443'),
+      peer(6, 'https://a.example.:8443'),
+    ]
+    expect(relayTargets(peers, 1, PATH)).to.deep.equal([
+      { instanceId: 2, apiUrl: 'https://a.example.', url: 'https://a.example./api/dm/relay' },
+      { instanceId: 6, apiUrl: 'https://a.example.:8443', url: 'https://a.example.:8443/api/dm/relay' },
+    ])
+  })
+
+  it('skips entries on our own URL written with a trailing dot', () => {
+    const peers = [
+      peer(1, 'https://self.example'),
+      peer(2, 'https://self.example.'),
+      peer(3, 'https://b.example'),
+    ]
+    expect(relayTargets(peers, 1, PATH).map(t => t.instanceId)).to.deep.equal([3])
+  })
+
   it('skips other instances registered on our own URL', () => {
     const peers = [
       peer(1, 'https://self.example'),
