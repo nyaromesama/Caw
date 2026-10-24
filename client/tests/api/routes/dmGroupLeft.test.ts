@@ -67,6 +67,27 @@ const conversation = (id: string) => ({
   participants: rows.filter(r => r.conversationId === id).map(r => ({ ...r, identity: { publicKey: 'pk', user: { username: `u${r.userId}` } } })),
 })
 
+// Holds the next participant read for one user: the result is taken from the
+// table when the read starts, and handed back only on release(), the way a
+// slow query returns a snapshot from before a concurrent write.
+let gate: { userId: number; captured: () => void; wait: Promise<void> } | null = null
+function holdNextRead(userId: number) {
+  let captured!: () => void
+  let release!: () => void
+  const started = new Promise<void>(r => { captured = r })
+  gate = { userId, captured, wait: new Promise<void>(r => { release = r }) }
+  return { started, release }
+}
+async function held<T>(userId: number | undefined, result: T): Promise<T> {
+  if (!gate || gate.userId !== userId) return result
+  const g = gate
+  gate = null
+  g.captured()
+  await g.wait
+  return result
+}
+const snapshot = <T>(v: T): T => (v ? JSON.parse(JSON.stringify(v)) : v)
+
 const reactionsCreated: any[] = []
 const deletionsUpserted: any[] = []
 const receiptsCreated: any[] = []
@@ -77,8 +98,8 @@ const fakeModels: Record<string, Record<string, (args?: any) => any>> = {
     findUnique: async (a: any) => ({ tokenId: a.where.tokenId, address: addr(a.where.tokenId), username: `u${a.where.tokenId}` }),
   },
   conversationParticipant: {
-    findUnique: async (a: any) => byKey(a),
-    findMany: async (a: any) => rows.filter(r => matches(r, a.where)),
+    findUnique: async (a: any) => held(a.where.conversationId_userId?.userId, snapshot(byKey(a))),
+    findMany: async (a: any) => held(a.where?.userId, snapshot(rows.filter(r => matches(r, a.where)))),
     update: async (a: any) => { const r = rows.find(x => x.id === a.where.id)!; Object.assign(r, a.data); return r },
     create: async (a: any) => { const r = { id: rows.length + 1, leftAt: null, joinedAt: new Date(), ...a.data }; rows.push(r); return r },
     count: async (a: any) => rows.filter(r => matches(r, a.where)).length,
@@ -181,6 +202,7 @@ describe('DM routes and socket for a group member who left', function () {
 
   beforeEach(() => {
     resetRows()
+    gate = null
     reactionsCreated.length = 0
     deletionsUpserted.length = 0
     receiptsCreated.length = 0
@@ -284,5 +306,73 @@ describe('DM routes and socket for a group member who left', function () {
     const got = (s: any) => s.got.filter(([e, d]: [string, any]) => e === 'new-conversation' && d?.id === GROUP)
     expect(got(member)).to.have.length(1)
     expect(got(left)).to.have.length(0)
+  })
+
+  // A join reads the membership, then joins once the read comes back. These
+  // hold that read until the member has left (200, sockets taken out of the
+  // room), then let it finish with the membership it saw before.
+  const leave = (userId: number) => request(base).post(`/api/dm/groups/${GROUP}/leave`)
+    .set('x-session-token', token(userId)).send({ userId })
+
+  it('a join-conversation in flight when the member leaves does not put the socket back', async () => {
+    const member = await connect(MEMBER)
+    await settle()
+    const read = holdNextRead(MEMBER)
+    member.emit('join-conversation', GROUP)
+    await read.started
+    expect((await leave(MEMBER)).status).to.equal(200)
+    await settle()
+    read.release()
+    await settle()
+    dmWebSocketService.broadcastMessage({ id: 'g4', conversationId: GROUP, senderId: OWNER })
+    await settle()
+    expect(events(member, 'new-message', GROUP)).to.have.length(0)
+  })
+
+  it('a join-conversation in flight when the member is removed does not put the socket back', async () => {
+    const member = await connect(MEMBER)
+    await settle()
+    const read = holdNextRead(MEMBER)
+    member.emit('join-conversation', GROUP)
+    await read.started
+    const res = await request(base).delete(`/api/dm/groups/${GROUP}/members/${MEMBER}`)
+      .set('x-session-token', token(OWNER)).send({ actorUserId: OWNER })
+    expect(res.status).to.equal(200)
+    await settle()
+    read.release()
+    await settle()
+    dmWebSocketService.broadcastMessage({ id: 'g7', conversationId: GROUP, senderId: OWNER })
+    await settle()
+    expect(events(member, 'new-message', GROUP)).to.have.length(0)
+  })
+
+  it('the rooms joined on connect, read before the member leaves, leave out the group', async () => {
+    const read = holdNextRead(MEMBER)
+    const member = await connect(MEMBER)
+    await read.started
+    expect((await leave(MEMBER)).status).to.equal(200)
+    await settle()
+    read.release()
+    await settle()
+    dmWebSocketService.broadcastMessage({ id: 'g5', conversationId: GROUP, senderId: OWNER })
+    await settle()
+    expect(events(member, 'new-message', GROUP)).to.have.length(0)
+  })
+
+  it('a member who leaves and rejoins by invite while a join is in flight is in the room', async () => {
+    const member = await connect(MEMBER)
+    await settle()
+    const read = holdNextRead(MEMBER)
+    member.emit('join-conversation', GROUP)
+    await read.started
+    expect((await leave(MEMBER)).status).to.equal(200)
+    const rejoin = await request(base).post('/api/dm/groups/join/some-token')
+      .set('x-session-token', token(MEMBER)).send({ userId: MEMBER })
+    expect(rejoin.status).to.equal(200)
+    read.release()
+    await settle()
+    dmWebSocketService.broadcastMessage({ id: 'g6', conversationId: GROUP, senderId: OWNER })
+    await settle()
+    expect(events(member, 'new-message', GROUP)).to.have.length(1)
   })
 })

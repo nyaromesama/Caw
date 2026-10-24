@@ -56,6 +56,9 @@ function consumeToken(
 export class DmWebSocketService {
   private io: SocketIOServer | null = null
   private userSockets: Map<number, Set<string>> = new Map()
+  // How many times each user has been taken out of a conversation's room
+  // (removeUserFromConversation). See readMembership.
+  private removals: Map<number, number> = new Map()
 
   initialize(server: HttpServer) {
     console.log('[DM-WS] Initializing WebSocket server on path: /dm-ws')
@@ -142,7 +145,8 @@ export class DmWebSocketService {
       this.joinUserConversations(socket)
 
       socket.on('join-conversation', async (conversationId: string) => {
-        const participant = await getActiveParticipant(prisma, conversationId, socket.userId!)
+        const participant = await this.readMembership(socket.userId!, () =>
+          getActiveParticipant(prisma, conversationId, socket.userId!))
 
         if (participant) {
           socket.join(`conversation:${conversationId}`)
@@ -226,13 +230,32 @@ export class DmWebSocketService {
   private async joinUserConversations(socket: AuthenticatedSocket) {
     if (!socket.userId) return
 
-    const conversations = await prisma.conversationParticipant.findMany({
-      where: { userId: socket.userId, leftAt: null },
-      select: { conversationId: true }
-    })
+    const userId = socket.userId
+    const conversations = await this.readMembership(userId, () =>
+      prisma.conversationParticipant.findMany({
+        where: { userId, leftAt: null },
+        select: { conversationId: true }
+      }))
 
     for (const { conversationId } of conversations) {
       socket.join(`conversation:${conversationId}`)
+    }
+  }
+
+  /**
+   * Run a membership read for a joining socket, and run it again if the
+   * user was taken out of a room while it was in flight. A leave or removal
+   * commits, then calls removeUserFromConversation; a read that started
+   * before the commit can still report the membership, and joining on it
+   * after the socketsLeave would put the socket back in the room. A read
+   * that starts after the count moved sees the commit. The caller joins in
+   * the same tick as the check, so a removal can't land in between.
+   */
+  private async readMembership<T>(userId: number, read: () => Promise<T>): Promise<T> {
+    for (;;) {
+      const before = this.removals.get(userId) ?? 0
+      const result = await read()
+      if ((this.removals.get(userId) ?? 0) === before) return result
     }
   }
 
@@ -289,6 +312,7 @@ export class DmWebSocketService {
    */
   removeUserFromConversation(userId: number, conversationId: string) {
     if (!this.io) return
+    this.removals.set(userId, (this.removals.get(userId) ?? 0) + 1)
     this.io.in(`user:${userId}`).socketsLeave(`conversation:${conversationId}`)
   }
 
