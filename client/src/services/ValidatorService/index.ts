@@ -16,6 +16,7 @@ import { withWalletLock } from '../../utils/walletQueue'
 import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { decompressActionText } from '../../utils/decompressActionText'
+import { rpcErrorText } from '../../utils/rpcErrorText'
 import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
 import { getIndexerStats } from '../../utils/indexerHealth'
 import type { AbstractProvider } from 'ethers'
@@ -2094,8 +2095,10 @@ export const validatorService: Service = {
           const errData: string | undefined =
             err?.data || err?.error?.data || err?.info?.error?.data
           const decoded = errData ? decodeCustomError(errData) : null
-          const revertMatch = err.message.match(/execution reverted: (.+)/);
-          const revertReason = decoded || revertMatch?.[1] || err.message;
+          // Not err.message: it carries the whole tx (from, calldata), see rpcErrorText.
+          const errText = rpcErrorText(err)
+          const revertMatch = errText.match(/execution reverted: (.+)/);
+          const revertReason = decoded || revertMatch?.[1] || errText;
           console.log(`Execution reverted with reason: ${revertReason}`);
 
           // Check for specific duplicate cawonce error
@@ -2151,7 +2154,7 @@ export const validatorService: Service = {
           } else if (err.message?.includes('already known')) {
             return 'Transaction already known - duplicate cawonce';
           } else {
-            return `Simulation error: ${err.message || 'Unknown error'}`;
+            return `Simulation error: ${rpcErrorText(err) || 'Unknown error'}`;
           }
         });
 
