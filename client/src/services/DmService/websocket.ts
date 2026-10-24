@@ -3,6 +3,7 @@ import { Server as SocketIOServer, Socket } from 'socket.io'
 import { prisma } from '../../prismaClient'
 import { getSession } from '../../api/sessionStore'
 import { SESSION_COOKIE_NAME } from '../../api/middleware/auth'
+import { getActiveParticipant } from './groupService'
 
 interface AuthenticatedSocket extends Socket {
   userId?: number
@@ -141,14 +142,7 @@ export class DmWebSocketService {
       this.joinUserConversations(socket)
 
       socket.on('join-conversation', async (conversationId: string) => {
-        const participant = await prisma.conversationParticipant.findUnique({
-          where: {
-            conversationId_userId: {
-              conversationId,
-              userId: socket.userId!
-            }
-          }
-        })
+        const participant = await getActiveParticipant(prisma, conversationId, socket.userId!)
 
         if (participant) {
           socket.join(`conversation:${conversationId}`)
@@ -187,7 +181,7 @@ export class DmWebSocketService {
 
         const convIds = [...new Set(rawMessages.map(m => m.conversationId))]
         const memberships = await prisma.conversationParticipant.findMany({
-          where: { conversationId: { in: convIds }, userId: socket.userId! },
+          where: { conversationId: { in: convIds }, userId: socket.userId!, leftAt: null },
           select: { conversationId: true }
         })
         const memberConvIds = new Set(memberships.map(p => p.conversationId))
@@ -233,7 +227,7 @@ export class DmWebSocketService {
     if (!socket.userId) return
 
     const conversations = await prisma.conversationParticipant.findMany({
-      where: { userId: socket.userId },
+      where: { userId: socket.userId, leftAt: null },
       select: { conversationId: true }
     })
 
@@ -285,6 +279,17 @@ export class DmWebSocketService {
     // Splice in conversationId so receivers can route by conversation
     // without joining every event to its room context.
     this.emitToConversation(conversationId, 'conversation-update', { conversationId, ...update })
+  }
+
+  /**
+   * Take every socket of a user who just left or was removed out of the
+   * group's room, so live events stop at once instead of at their next
+   * reconnect (joinUserConversations skips left rows). Every socket of a
+   * user is in `user:<id>` (see 'connection').
+   */
+  removeUserFromConversation(userId: number, conversationId: string) {
+    if (!this.io) return
+    this.io.in(`user:${userId}`).socketsLeave(`conversation:${conversationId}`)
   }
 
   notifyNewConversation(userId: number, conversation: any) {
