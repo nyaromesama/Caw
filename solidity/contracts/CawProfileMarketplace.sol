@@ -254,7 +254,7 @@ contract CawProfileMarketplace is ReentrancyGuard {
         emit PayoutQueued(listing.seller, price);
 
         // Transfer NFT to buyer and sync L2 ownership (excess ETH covers LZ fee)
-        _transferAndSync(msg.sender, listing.tokenId, lzDestId, msg.value - price);
+        _transferAndSync(listing.seller, msg.sender, listing.tokenId, lzDestId, msg.value - price);
 
         emit Sale(listingId, listing.tokenId, msg.sender, price, address(0));
     }
@@ -284,7 +284,7 @@ contract CawProfileMarketplace is ReentrancyGuard {
         pendingTokenPayouts[listing.seller][listing.paymentToken] += price;
 
         // Transfer NFT to buyer and sync L2 (msg.value covers LZ fee)
-        _transferAndSync(msg.sender, listing.tokenId, lzDestId, msg.value);
+        _transferAndSync(listing.seller, msg.sender, listing.tokenId, lzDestId, msg.value);
 
         emit Sale(listingId, listing.tokenId, msg.sender, price, listing.paymentToken);
     }
@@ -397,7 +397,7 @@ contract CawProfileMarketplace is ReentrancyGuard {
         }
 
         // Transfer NFT to winner and sync L2 (msg.value covers LZ fee)
-        _transferAndSync(listing.highestBidder, listing.tokenId, lzDestId, msg.value);
+        _transferAndSync(listing.seller, listing.highestBidder, listing.tokenId, lzDestId, msg.value);
 
         emit AuctionSettled(listingId, listing.highestBidder, listing.highestBid);
     }
@@ -642,7 +642,7 @@ contract CawProfileMarketplace is ReentrancyGuard {
         }
 
         // Transfer NFT to offerer and sync L2 (msg.value covers LZ fee)
-        _transferAndSync(offer.offerer, tokenId, lzDestId, msg.value);
+        _transferAndSync(msg.sender, offer.offerer, tokenId, lzDestId, msg.value);
 
         emit OfferAccepted(offerId, tokenId, msg.sender, offer.offerer, offer.amount, offer.paymentToken);
     }
@@ -783,8 +783,15 @@ contract CawProfileMarketplace is ReentrancyGuard {
     ///      Same queue flush as transferAndSync (syncTransfer → _updateNewOwners).
     ///      Same MP-1 fallback as cancelOffer: a caller that can't take ETH gets
     ///      it via pendingPayouts.
-    function _transferAndSync(address to, uint256 tokenId, uint32 lzDestId, uint256 lzEth) internal {
-        cawProfile.transferFrom(cawProfile.ownerOf(tokenId), to, tokenId);
+    ///
+    ///      `from` is the seller the sale pays. Listings don't escrow the token,
+    ///      so a seller can transfer it away while the listing is still active;
+    ///      moving it from ownerOf() would then take the new owner's token (if
+    ///      they have approved the marketplace) and pay the old seller. With
+    ///      `from` the transfer reverts instead, and reclaimListing / reclaimBid
+    ///      clear the listing.
+    function _transferAndSync(address from, address to, uint256 tokenId, uint32 lzDestId, uint256 lzEth) internal {
+        cawProfile.transferFrom(from, to, tokenId);
 
         uint32 eid = lzDestId == 0 ? defaultLzDestId : lzDestId;
         (uint32[] memory ids, address[] memory owners, uint64[] memory stamps) =
