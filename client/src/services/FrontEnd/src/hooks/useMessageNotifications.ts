@@ -4,6 +4,7 @@ import { io, Socket } from 'socket.io-client'
 import { useAuthStore } from '~/store/authStore'
 import { useInstanceStore } from '~/store/instanceStore'
 import { API_HOST } from '~/api/client'
+import { useT } from '~/i18n/I18nProvider'
 
 // Resolve at connect time so we pick up the registered API host even if the
 // page is served from a separate FE-only node (origin would be the FE host,
@@ -49,6 +50,12 @@ export function useMessageNotifications({
   const socketRef = useRef<Socket | null>(null)
   const queryClient = useQueryClient()
   const notificationPermissionRef = useRef<NotificationPermission>('default')
+  // The socket listener keeps the showNotification from the render that
+  // connected, so it reads t through a ref to get the catalog that has
+  // loaded since.
+  const t = useT()
+  const tRef = useRef(t)
+  tRef.current = t
 
   // Request notification permission
   useEffect(() => {
@@ -69,7 +76,7 @@ export function useMessageNotifications({
     if (document.hasFocus()) return // Don't show if user is on the page
 
     const title = message.sender?.user.username || 'New Message'
-    const body = 'Encrypted message'
+    const body = tRef.current('messages.preview.encrypted')
 
     const notification = new Notification(title, {
       body,
