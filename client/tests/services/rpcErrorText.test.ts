@@ -1,6 +1,6 @@
 import { expect } from 'chai'
 import { JsonRpcProvider, Interface, FetchRequest, FetchResponse, hexlify } from 'ethers'
-import { rpcErrorText } from '../../src/utils/rpcErrorText'
+import { rpcErrorText, revertReasonText } from '../../src/utils/rpcErrorText'
 import { packActions, packGroupedSignatures } from '../../src/utils/packActions'
 
 const iface = new Interface([
@@ -32,8 +32,6 @@ function ethCallError(error: { code: number; message: string; data?: string }) {
 }
 
 describe('rpcErrorText', () => {
-  after(() => provider.destroy())
-
   it('leaves out the transaction of a failed eth_call', () => {
     const err = ethCallError({ code: -32000, message: 'execution reverted' })
     expect(err.code).to.equal('CALL_EXCEPTION')
@@ -72,5 +70,27 @@ describe('rpcErrorText', () => {
     expect(rpcErrorText(new Error('RPC call timeout after 30 seconds'))).to.equal('RPC call timeout after 30 seconds')
     expect(rpcErrorText(undefined)).to.equal('')
     expect(rpcErrorText({})).to.equal('')
+  })
+})
+
+describe('revertReasonText', () => {
+  // The last block destroys the provider; the blocks above use it, too.
+  after(() => provider.destroy())
+
+  it('adds the selector of a custom error, without its arguments', () => {
+    const data = '0xdeadbeef' + 'ab429cd0'.repeat(8)
+    const err = ethCallError({ code: 3, message: 'execution reverted', data })
+    expect(err.message).to.include(data)
+    expect(revertReasonText(err, null)).to.equal('execution reverted (unknown custom error) (0xdeadbeef)')
+  })
+
+  it("uses the caller's name for the error", () => {
+    const err = ethCallError({ code: 3, message: 'execution reverted', data: '0x734a00c1' })
+    expect(revertReasonText(err, 'NoWithdrawFee')).to.equal('NoWithdrawFee')
+  })
+
+  it('adds nothing without revert data', () => {
+    const err = ethCallError({ code: -32000, message: 'execution reverted' })
+    expect(revertReasonText(err, null)).to.equal('missing revert data (execution reverted)')
   })
 })

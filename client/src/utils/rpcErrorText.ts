@@ -19,3 +19,19 @@ export function rpcErrorText(err: any): string {
     ? `${text} (${nodeMessage})`
     : text
 }
+
+// The reason of a reverted eth_call: `decoded` (the caller's name for the
+// error) when there is one, else a require/revert string, else the short
+// text. ethers' short text for a custom error ("execution reverted (unknown
+// custom error)") leaves out the revert data, so add its 4-byte selector.
+// Only the selector: the arguments can hold any digits, 429 among them.
+export function revertReasonText(err: any, decoded: string | null): string {
+  if (decoded) return decoded
+  const text = rpcErrorText(err)
+  const reason = text.match(/execution reverted: (.+)/)?.[1]
+  if (reason) return reason
+  const data = err?.data || err?.error?.data || err?.info?.error?.data
+  return typeof data === 'string' && /^0x[0-9a-fA-F]{8}/.test(data)
+    ? `${text} (${data.slice(0, 10)})`
+    : text
+}

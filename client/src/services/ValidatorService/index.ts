@@ -11,12 +11,12 @@ import { deployments, type Env, type ChainKey } from '../../abi/deployments'
 import { WebSocketProvider, JsonRpcProvider, Contract, Interface, keccak256, solidityPacked, AbiCoder } from 'ethers'
 import { packActions, packSignatures, packGroupedSignatures, bytesToHex, getPackedActionSlices, unpackActions, unpackPerActionSigs } from '../../utils/packActions'
 import { buildCheckpointMerkleTree } from '../../utils/checkpointMerkle'
+import { rpcErrorText, revertReasonText } from '../../utils/rpcErrorText'
 import { tryClaimChallengeLock, releaseChallengeLock } from '../../utils/challengeLock'
 import { withWalletLock } from '../../utils/walletQueue'
 import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { decompressActionText } from '../../utils/decompressActionText'
-import { rpcErrorText } from '../../utils/rpcErrorText'
 import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
 import { getIndexerStats } from '../../utils/indexerHealth'
 import type { AbstractProvider } from 'ethers'
@@ -2096,9 +2096,7 @@ export const validatorService: Service = {
             err?.data || err?.error?.data || err?.info?.error?.data
           const decoded = errData ? decodeCustomError(errData) : null
           // Not err.message: it carries the whole tx (from, calldata), see rpcErrorText.
-          const errText = rpcErrorText(err)
-          const revertMatch = errText.match(/execution reverted: (.+)/);
-          const revertReason = decoded || revertMatch?.[1] || errText;
+          const revertReason = revertReasonText(err, decoded);
           console.log(`Execution reverted with reason: ${revertReason}`);
 
           // Check for specific duplicate cawonce error
