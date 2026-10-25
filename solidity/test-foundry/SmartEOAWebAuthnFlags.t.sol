@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../contracts/SmartEOA.sol";
 
 /// @dev Real P-256 (vm.signP256) verified by the real EIP-7951 precompile
-///      (vm.setEvmVersion("osaka")), no mock at 0x0100.
+///      (osaka EVM), no mock at 0x0100.
 ///
 ///      test_control_*  : must pass on master and after a fix.
 ///      test_reject_*   : the behaviour a fix should have. On master these FAIL
@@ -28,13 +28,27 @@ contract SmartEOAWebAuthnFlagsTest is Test {
     address fallbackKey = address(0xFA11);
 
     function setUp() public {
-        vm.setEvmVersion("osaka");
+        _requireP256Precompile();
         acct = new SmartEOA();
         (uint256 x, uint256 y) = vm.publicKeyP256(PK);
         acct.initialize(bytes32(x), bytes32(y), fallbackKey, payable(address(0)), "");
     }
 
     // ---------------------------------------------------------------- helpers
+
+    /// @dev These tests need the real EIP-7951 precompile at 0x0100, which forge
+    ///      only has when it runs the osaka EVM (its default as of forge 1.8.5).
+    ///      vm.setEvmVersion("osaka") doesn't add it, so check for it here.
+    function _requireP256Precompile() internal view {
+        bytes32 h = keccak256("p256-precompile-check");
+        (bytes32 r, bytes32 s) = vm.signP256(1, h);
+        (uint256 x, uint256 y) = vm.publicKeyP256(1);
+        (bool ok, bytes memory ret) = address(0x0100).staticcall(abi.encodePacked(h, r, s, x, y));
+        require(
+            ok && ret.length == 32 && abi.decode(ret, (uint256)) == 1,
+            "no P-256 precompile at 0x0100: run with the osaka EVM, not --evm-version prague"
+        );
+    }
 
     function _authData(string memory rpId, bytes1 flags) internal pure returns (bytes memory) {
         return abi.encodePacked(sha256(bytes(rpId)), flags, uint32(1));
