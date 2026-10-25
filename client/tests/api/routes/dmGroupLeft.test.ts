@@ -359,6 +359,50 @@ describe('DM routes and socket for a group member who left', function () {
     expect(events(member, 'new-message', GROUP)).to.have.length(0)
   })
 
+  // A leave can also land between readMembership's final check and the
+  // join. The removal below is queued while the check runs, so it runs before
+  // anything that awaits the check's result.
+  function leaveRightAfterCheck(userId: number) {
+    const removals = (dmWebSocketService as any).removals as Map<number, number>
+    const get = removals.get
+    const state = { left: false }
+    let calls = 0
+    removals.get = function (this: Map<number, number>, k: number) {
+      if (k === userId && ++calls === 2) {
+        removals.get = get
+        queueMicrotask(() => {
+          rows.find(r => r.conversationId === GROUP && r.userId === userId)!.leftAt = new Date()
+          dmWebSocketService.removeUserFromConversation(userId, GROUP)
+          state.left = true
+        })
+      }
+      return get.call(this, k)
+    }
+    return state
+  }
+
+  it('a join-conversation whose member leaves right after the membership check does not put the socket back', async () => {
+    const member = await connect(MEMBER)
+    await settle()
+    const leftAfterCheck = leaveRightAfterCheck(MEMBER)
+    member.emit('join-conversation', GROUP)
+    await settle()
+    expect(leftAfterCheck.left).to.equal(true)
+    dmWebSocketService.broadcastMessage({ id: 'g8', conversationId: GROUP, senderId: OWNER })
+    await settle()
+    expect(events(member, 'new-message', GROUP)).to.have.length(0)
+  })
+
+  it('the rooms joined on connect leave out a group the member leaves right after the membership check', async () => {
+    const leftAfterCheck = leaveRightAfterCheck(MEMBER)
+    const member = await connect(MEMBER)
+    await settle()
+    expect(leftAfterCheck.left).to.equal(true)
+    dmWebSocketService.broadcastMessage({ id: 'g9', conversationId: GROUP, senderId: OWNER })
+    await settle()
+    expect(events(member, 'new-message', GROUP)).to.have.length(0)
+  })
+
   it('a member who leaves and rejoins by invite while a join is in flight is in the room', async () => {
     const member = await connect(MEMBER)
     await settle()

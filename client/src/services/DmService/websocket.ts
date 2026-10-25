@@ -145,12 +145,13 @@ export class DmWebSocketService {
       this.joinUserConversations(socket)
 
       socket.on('join-conversation', async (conversationId: string) => {
-        const participant = await this.readMembership(socket.userId!, () =>
-          getActiveParticipant(prisma, conversationId, socket.userId!))
-
-        if (participant) {
-          socket.join(`conversation:${conversationId}`)
-        }
+        await this.readMembership(
+          socket.userId!,
+          () => getActiveParticipant(prisma, conversationId, socket.userId!),
+          participant => {
+            if (participant) socket.join(`conversation:${conversationId}`)
+          },
+        )
       })
 
       socket.on('leave-conversation', (conversationId: string) => {
@@ -231,15 +232,18 @@ export class DmWebSocketService {
     if (!socket.userId) return
 
     const userId = socket.userId
-    const conversations = await this.readMembership(userId, () =>
-      prisma.conversationParticipant.findMany({
+    await this.readMembership(
+      userId,
+      () => prisma.conversationParticipant.findMany({
         where: { userId, leftAt: null },
         select: { conversationId: true }
-      }))
-
-    for (const { conversationId } of conversations) {
-      socket.join(`conversation:${conversationId}`)
-    }
+      }),
+      conversations => {
+        for (const { conversationId } of conversations) {
+          socket.join(`conversation:${conversationId}`)
+        }
+      },
+    )
   }
 
   /**
@@ -248,14 +252,20 @@ export class DmWebSocketService {
    * commits, then calls removeUserFromConversation; a read that started
    * before the commit can still report the membership, and joining on it
    * after the socketsLeave would put the socket back in the room. A read
-   * that starts after the count moved sees the commit. The caller joins in
-   * the same tick as the check, so a removal can't land in between.
+   * that starts after the count moved sees the commit. join runs right
+   * after the check, with no await in between, so a removal can't land
+   * between them. (The caller's own await on this method would be a later
+   * microtask.) This holds for the default in-memory adapter, where
+   * socket.join and socketsLeave take effect synchronously.
    */
-  private async readMembership<T>(userId: number, read: () => Promise<T>): Promise<T> {
+  private async readMembership<T>(userId: number, read: () => Promise<T>, join: (result: T) => void): Promise<void> {
     for (;;) {
       const before = this.removals.get(userId) ?? 0
       const result = await read()
-      if ((this.removals.get(userId) ?? 0) === before) return result
+      if ((this.removals.get(userId) ?? 0) === before) {
+        join(result)
+        return
+      }
     }
   }
 
