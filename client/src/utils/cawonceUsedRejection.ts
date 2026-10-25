@@ -18,8 +18,10 @@ export type CawonceUsedResolution = 'done' | 'failed' | 'awaiting_indexer'
  *   'awaiting_indexer' — moved to awaiting_indexer here; the recheck in
  *                        fetchPendingQueue takes it from there.
  *   'failed'           — nothing written; the caller fails the row as before.
- *   'retry'            — resolve threw; reset to pending here so the next
- *                        poll simulates the row again.
+ *   'retry'            — resolve threw (reset to pending here), or a status
+ *                        write threw (the row is left as it was). Leave the
+ *                        row out; a row still in processing goes back to
+ *                        pending in fetchPendingQueue's 30-second sweep.
  */
 export type CawonceUsedSettlement = CawonceUsedResolution | 'retry'
 
@@ -28,23 +30,35 @@ export interface CawonceUsedSettlers {
   markValidatedByPeer: () => Promise<unknown>
   markAwaitingIndexer: () => Promise<unknown>
   resetToPending: (err: unknown) => Promise<unknown>
+  writeFailed: (err: unknown) => void
 }
 
 export function isCawonceUsedRejection(rejection: string | null | undefined): boolean {
   return (rejection ?? '').includes('Cawonce already used')
 }
 
+// The rows that passed were already submitted, so nothing here may throw into
+// the batch's catch: the poll's catch would put those rows back to pending,
+// and the multi-network sub-batch catch would mark them failed.
 export async function settleCawonceUsedRejection(s: CawonceUsedSettlers): Promise<CawonceUsedSettlement> {
   let resolution: CawonceUsedResolution
   try {
     resolution = await s.resolve()
   } catch (err) {
-    // The rows that passed were already submitted, so a throw here must not
-    // reach the poll's catch (it would put those back to pending too).
-    await s.resetToPending(err)
+    await tryWrite(s, () => s.resetToPending(err))
     return 'retry'
   }
-  if (resolution === 'done') await s.markValidatedByPeer()
-  else if (resolution === 'awaiting_indexer') await s.markAwaitingIndexer()
-  return resolution
+  if (resolution === 'failed') return 'failed'
+  const wrote = await tryWrite(s, resolution === 'done' ? () => s.markValidatedByPeer() : () => s.markAwaitingIndexer())
+  return wrote ? resolution : 'retry'
+}
+
+async function tryWrite(s: CawonceUsedSettlers, write: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await write()
+    return true
+  } catch (err) {
+    s.writeFailed(err)
+    return false
+  }
 }

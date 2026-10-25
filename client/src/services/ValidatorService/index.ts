@@ -2860,6 +2860,9 @@ console.log("succeededKeys", succeededKeys)
             data: { status: 'pending' },
           })
         },
+        writeFailed: (err: any) => {
+          console.error(`[Validator] TxQueue ${entry.id}: status write for Cawonce ${data.cawonce} failed, leaving the row for the next poll — ${err?.message ?? String(err)}`)
+        },
       })
       if (settled === 'done') {
         console.log(`[Validator] TxQueue ${entry.id}: Same action exists for senderId=${data.senderId} cawonce=${data.cawonce} — marking done`)

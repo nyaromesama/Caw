@@ -8,15 +8,22 @@ import {
 // A "Cawonce already used" rejection in a partly passing batch goes through
 // resolveCawonceUsed, as it does when every row is rejected. These cover
 // which status write each resolution makes.
-function settlers(resolve: () => Promise<CawonceUsedResolution>) {
+function settlers(resolve: () => Promise<CawonceUsedResolution>, failWrite?: string) {
   const calls: string[] = []
+  const write = (name: string, call: string) => async () => {
+    if (name === failWrite) throw new Error(`${name} write failed`)
+    calls.push(call)
+  }
   return {
     calls,
     s: {
       resolve,
-      markValidatedByPeer: async () => { calls.push('validated_by_peer') },
-      markAwaitingIndexer: async () => { calls.push('awaiting_indexer') },
-      resetToPending: async (err: unknown) => { calls.push(`pending: ${(err as Error).message}`) },
+      markValidatedByPeer: write('markValidatedByPeer', 'validated_by_peer'),
+      markAwaitingIndexer: write('markAwaitingIndexer', 'awaiting_indexer'),
+      resetToPending: async (err: unknown) => {
+        await write('resetToPending', `pending: ${(err as Error).message}`)()
+      },
+      writeFailed: (err: unknown) => { calls.push(`write failed: ${(err as Error).message}`) },
     },
   }
 }
@@ -58,5 +65,25 @@ describe('settleCawonceUsedRejection', () => {
     const { calls, s } = settlers(async () => { throw new Error('getBlockNumber failed') })
     expect(await settleCawonceUsedRejection(s)).to.equal('retry')
     expect(calls).to.deep.equal(['pending: getBlockNumber failed'])
+  })
+
+  // The other rows of the batch were already submitted, so a failed status
+  // write here must not throw into the batch's catch.
+  it("returns 'retry' instead of throwing when the validated_by_peer write fails", async () => {
+    const { calls, s } = settlers(async () => 'done', 'markValidatedByPeer')
+    expect(await settleCawonceUsedRejection(s)).to.equal('retry')
+    expect(calls).to.deep.equal(['write failed: markValidatedByPeer write failed'])
+  })
+
+  it("returns 'retry' instead of throwing when the awaiting_indexer write fails", async () => {
+    const { calls, s } = settlers(async () => 'awaiting_indexer', 'markAwaitingIndexer')
+    expect(await settleCawonceUsedRejection(s)).to.equal('retry')
+    expect(calls).to.deep.equal(['write failed: markAwaitingIndexer write failed'])
+  })
+
+  it("returns 'retry' instead of throwing when resolve and the reset to pending both fail", async () => {
+    const { calls, s } = settlers(async () => { throw new Error('getBlockNumber failed') }, 'resetToPending')
+    expect(await settleCawonceUsedRejection(s)).to.equal('retry')
+    expect(calls).to.deep.equal(['write failed: resetToPending write failed'])
   })
 })
