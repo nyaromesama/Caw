@@ -120,10 +120,15 @@ export const useSessionKeyStore = create<SessionKeyState>()(
       setSession: (entry) => {
         const wallet = (entry.ownerAddress || get().activeWallet || '').toLowerCase()
         if (!wallet) return
+        // getSession()/getActiveSession() hand out encrypted entries with the
+        // decrypted key filled in from memory. Callers spread those straight
+        // back in here (spend sync, SessionLimitExceeded), so never persist
+        // anything but the placeholder for an encrypted entry.
+        const privateKey = entry.encrypted ? ('0xencrypted' as `0x${string}`) : entry.privateKey
         set(state => ({
           sessions: {
             ...state.sessions,
-            [wallet]: { spent: '0', ...entry, ownerAddress: wallet },
+            [wallet]: { spent: '0', ...entry, privateKey, ownerAddress: wallet },
           },
         }))
       },
