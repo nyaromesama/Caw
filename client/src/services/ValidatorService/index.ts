@@ -2803,6 +2803,11 @@ console.log("succeededKeys", succeededKeys)
             where: { id: entry.id },
             data: { status: 'awaiting_indexer', reason: 'awaiting Action indexer' },
           })
+        } else if (processedByOther) {
+          // A peer landed this same action. Settle it like the other
+          // resolveCawonceUsed callers: validated_by_peer, with the session
+          // spend bumped once. A plain status write here skipped the bump.
+          await markTxQueueValidatedByPeer(entry.id, entry.payload, entry.signedTx)
         } else {
           // 'done' path (or non-terminal states like waiting_for_deposit).
           // No notification needed — the helper is only for terminal failures.
