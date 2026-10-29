@@ -18,7 +18,7 @@ import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { decompressActionText } from '../../utils/decompressActionText'
 import { groupERC1271Rows, estimateERC1271GroupBytes, canStartERC1271Group } from '../../utils/erc1271Groups'
-import { settleFailedERC1271Row } from '../../utils/erc1271Settle'
+import { settleFailedERC1271Row, isRetryableERC1271SubmitError } from '../../utils/erc1271Settle'
 import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
 import { getIndexerStats } from '../../utils/indexerHealth'
 import type { AbstractProvider } from 'ethers'
@@ -1806,6 +1806,9 @@ export const validatorService: Service = {
       validatorId: number,
       erc1271Data: { packedActions: string; sigs: string[]; rs: string[]; actions: any[] },
       quote: { nativeFee: bigint; withdrawFee: bigint; withdrawLzTokenAmount: bigint },
+      // Called once the tx is broadcast, so the caller can tell an error
+      // before the send from one after it (isRetryableERC1271SubmitError).
+      onSent: () => void = () => {},
     ): Promise<{ processed: Array<{ senderId: number; cawonce: number }>; receipt: any }> {
       if (!CAW_ACTIONS_ERC1271_ADDRESS) {
         throw new Error('[submitERC1271Actions] CAW_ACTIONS_ERC1271_ADDRESS not configured — cannot submit ERC-1271 batch')
@@ -1878,6 +1881,7 @@ export const validatorService: Service = {
           })
         })
         releaseSlot()
+        onSent()
         console.log(`[submitERC1271Actions] MILESTONE: submit path done — sent ${erc1271Data.actions.length} action(s), tx=${tx.hash}`)
 
         const receipt = await waitForReceipt(tx, TX_WAIT_TIMEOUT_MS)
@@ -4074,7 +4078,7 @@ console.log("succeededKeys", succeededKeys)
           let erc1271Finalized: Array<{ senderId: number; cawonce: number }> = []
           let erc1271SubmitError: string | null = null
           let erc1271Submitted = false
-          let erc1271TimedOut = false
+          let erc1271Retryable = false
           const erc1271Size = estimateERC1271GroupBytes(erc1271Bound)
           if (erc1271Size > MAX_ERC1271_CALLDATA_BYTES) {
             erc1271SubmitError = `Batch too large to submit (~${erc1271Size} bytes)`
@@ -4088,13 +4092,16 @@ console.log("succeededKeys", succeededKeys)
               packedSigs: '0x',
             })
 
+            let erc1271Sent = false
             try {
               erc1271Submitted = true
-              const erc1271Result = await submitERC1271Actions(validatorId, erc1271Data, erc1271Quote)
+              const erc1271Result = await submitERC1271Actions(
+                validatorId, erc1271Data, erc1271Quote, () => { erc1271Sent = true },
+              )
               erc1271Finalized = erc1271Result.processed
             } catch (erc1271Err: any) {
               erc1271SubmitError = erc1271Err.message || 'ERC-1271 submission failed'
-              erc1271TimedOut = erc1271Err instanceof TxWaitTimeoutError
+              erc1271Retryable = isRetryableERC1271SubmitError(erc1271Err, erc1271Sent, isTransientRpcError)
               console.error('[Validator] ERC-1271 submission failed:', erc1271SubmitError)
               // L-1 known gap: unlike the ECDSA path there is NO bisect here.
               // A single invalid action fails its whole group (one tx). Rows
@@ -4122,7 +4129,7 @@ console.log("succeededKeys", succeededKeys)
             } else if (erc1271Submitted && erc1271SubmitError) {
               const verdict = await settleFailedERC1271Row({
                 submitError: erc1271SubmitError,
-                timedOut: erc1271TimedOut,
+                retryable: erc1271Retryable,
                 isCawonceUsed: () => cawActions.isCawonceUsed(data.senderId, data.cawonce),
                 resolveCawonceUsed: () => resolveCawonceUsed(data, entry.updatedAt, httpProvider),
               })
