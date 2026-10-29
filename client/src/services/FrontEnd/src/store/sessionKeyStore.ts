@@ -340,9 +340,22 @@ initBroadcastVerification((walletAddress: string) => {
 // persists its whole state, so a session the other tab deleted or replaced
 // would come back. Re-read the store when another tab changes it.
 // localStorage.clear() fires with a null key.
+const storedVersion = (raw: string | null): number => {
+  try {
+    const version = raw ? JSON.parse(raw)?.version : undefined
+    return typeof version === 'number' ? version : -1
+  } catch {
+    return -1
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
     if (e.storageArea !== localStorage || (e.key !== null && e.key !== 'caw-session-keys')) return
+    // A tab on a newer bundle wrote a newer version. persist would migrate it
+    // with this tab's migrate and write it back as this tab's version, and the
+    // newer tab would migrate that and write again, back and forth.
+    if (storedVersion(localStorage.getItem('caw-session-keys')) > (useSessionKeyStore.persist.getOptions().version ?? 0)) return
     mergingOtherTab = true
     try {
       void useSessionKeyStore.persist.rehydrate()
