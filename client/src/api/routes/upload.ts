@@ -189,13 +189,14 @@ router.post('/', requireAuth({ anySession: true }), upload.array('media', 10), r
     const storage = mediaStorage()
     let urls: string[]
     try {
-      urls = await Promise.all(files.map(async file => {
-        const isVideo = file.mimetype.startsWith('video/')
-        const kind = isVideo ? 'videos' : 'images'
-        const filename = generateFilename(file.mimetype)
-        // Strip EXIF + check dimensions for images (L-1/L-2 audit fixes).
-        const buf = isVideo ? file.buffer : await stripExifAndCheckDimensions(file.buffer)
-        return storage.put(kind, filename, buf, file.mimetype)
+      // Strip EXIF + check dimensions for images (L-1/L-2 audit fixes). Do it
+      // for every file before storing any, so a file sharp rejects can't
+      // leave the others stored after the whole reservation is refunded.
+      const bufs = await Promise.all(files.map(file =>
+        file.mimetype.startsWith('video/') ? file.buffer : stripExifAndCheckDimensions(file.buffer)))
+      urls = await Promise.all(files.map((file, i) => {
+        const kind = file.mimetype.startsWith('video/') ? 'videos' : 'images'
+        return storage.put(kind, generateFilename(file.mimetype), bufs[i], file.mimetype)
       }))
     } catch (storageErr: any) {
       // Storage (or EXIF-strip) failed — refund the reservation so the user
@@ -457,19 +458,24 @@ router.post('/images', requireAuth({ field: 'tokenId', verifyOwnership: true }),
     const reservation = await reserveUpload('post', Number(tokenId), totalBytes)
     if (!reservation.ok) return postQuotaExceeded(res, reservation)
 
+    // Strip EXIF + enforce pixel-bomb dimension cap (L-1/L-2 audit fixes) on
+    // every image before storing any. A malformed image refunds the whole
+    // reservation, so nothing may have been stored by then.
+    const prepared: { stripped: Buffer; imageType: string }[] = []
+    for (const { buffer, imageType } of accepted) {
+      try {
+        prepared.push({ stripped: await stripExifAndCheckDimensions(buffer), imageType })
+      } catch (e: any) {
+        // Return 400 so the caller knows at least one failed.
+        await refundReservation('post', Number(tokenId), totalBytes)
+        return res.status(400).json({ error: e.message })
+      }
+    }
+
     const storage = mediaStorage()
     const uploadedUrls: string[] = []
     try {
-      for (const { buffer, imageType } of accepted) {
-        // Strip EXIF + enforce pixel-bomb dimension cap (L-1/L-2 audit fixes).
-        let stripped: Buffer
-        try {
-          stripped = await stripExifAndCheckDimensions(buffer)
-        } catch (e: any) {
-          // Skip this image — return 400 so the caller knows at least one failed.
-          await refundReservation('post', Number(tokenId), totalBytes)
-          return res.status(400).json({ error: e.message })
-        }
+      for (const { stripped, imageType } of prepared) {
         const fileExtension = BASE64_MIME_TO_EXT[imageType]
         const fileName = `${tokenId}_${Date.now()}_${randomBytes(8).toString('hex')}.${fileExtension}`
         uploadedUrls.push(await storage.put('images', fileName, stripped, imageType))

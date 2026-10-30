@@ -54,6 +54,8 @@ let app: express.Express
 const png = (w: number) =>
   sharp({ create: { width: w, height: w, channels: 3, background: { r: 9, g: 9, b: 9 } } }).png().toBuffer()
 const dataUrl = (buf: Buffer) => `data:image/png;base64,${buf.toString('base64')}`
+// A PNG signature followed by junk passes looksLikeImage but not sharp.
+const junk = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)])
 
 async function noisyPng(w: number) {
   // xorshift32: incompressible enough that the PNG stays far above 1MB.
@@ -145,11 +147,31 @@ describe('base64 upload routes and the daily post quota', () => {
   })
 
   it('POST /image refunds the reservation when sharp rejects the image', async () => {
-    // A PNG signature followed by junk passes looksLikeImage but not sharp.
-    const junk = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)])
     const res = await request(app).post('/api/upload/image').send({ tokenId: 7, image: dataUrl(junk) })
     expect(res.status).to.equal(400)
     expect(reserves).to.deep.equal([{ kind: 'post', tokenId: 7, bytes: junk.length }])
+    expect(refunds).to.deep.equal(reserves)
+    expect(puts).to.have.length(0)
+  })
+
+  it('POST /images with a malformed last image stores none of the others', async () => {
+    const a = await png(16)
+    const b = await png(24)
+    const res = await request(app).post('/api/upload/images').send({ tokenId: 7, images: [dataUrl(a), dataUrl(b), dataUrl(junk)] })
+    expect(res.status).to.equal(400)
+    expect(reserves).to.deep.equal([{ kind: 'post', tokenId: 7, bytes: a.length + b.length + junk.length }])
+    expect(refunds).to.deep.equal(reserves)
+    expect(puts).to.have.length(0)
+  })
+
+  it('multipart POST / with a malformed image stores none of the others', async () => {
+    const img = await png(16)
+    const res = await request(app).post('/api/upload').field('tokenId', '7')
+      .attach('media', img, { filename: 'a.png', contentType: 'image/png' })
+      .attach('media', junk, { filename: 'b.png', contentType: 'image/png' })
+    expect(res.status).to.not.equal(200)
+    // The other file's put would land after the response, so give it time.
+    await new Promise(resolve => setTimeout(resolve, 300))
     expect(refunds).to.deep.equal(reserves)
     expect(puts).to.have.length(0)
   })
