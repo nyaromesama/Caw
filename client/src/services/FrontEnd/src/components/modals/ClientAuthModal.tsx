@@ -26,16 +26,41 @@ import { apiFetch } from '~/api/client'
  *
  * DataCleaner also waits for a non-zero L2 balance, so skip the hint when
  * the balance is 0 (only a zero-cost action gets here then; it would sit
- * until the 48h timeout). Leave an existing hint alone.
+ * until the 48h timeout). Leave an existing hint alone while the submit
+ * paths would still forward it; replace one they would drop.
  */
 async function rememberAuthTx(tokenId: number, txHash: string) {
   try {
     const key = `caw:pendingDeposit:${tokenId}`
-    if (localStorage.getItem(key)) return
+    if (hasLiveHint(key)) return
     if ((await readOnChainStakeForHint(tokenId)) === 0n) return
-    if (localStorage.getItem(key)) return
+    if (hasLiveHint(key)) return
     localStorage.setItem(key, JSON.stringify({ txHash, at: Date.now() }))
   } catch { /* best effort — the action is still retried without it */ }
+}
+
+// Same test the submit paths in api/actions.ts apply before forwarding
+// pendingDepositTxHash: a 32-byte tx hash, less than 30 min old.
+function hasLiveHint(key: string): boolean {
+  try {
+    const hint = JSON.parse(localStorage.getItem(key) ?? 'null')
+    return typeof hint?.txHash === 'string'
+      && /^0x[0-9a-fA-F]{64}$/.test(hint.txHash)
+      && Date.now() - (hint.at ?? 0) < 30 * 60 * 1000
+  } catch { return false }
+}
+
+// Retry the original action 3 s after the auth tx (gives LZ a moment), once
+// the hint is written — but no more than HINT_WAIT_CAP_MS past that, so a
+// slow L2 read falls back to retrying without the hint, as before.
+const HINT_WAIT_CAP_MS = 2000
+function retryAfterHint(hinted: Promise<void>, cb: () => void) {
+  let fired = false
+  const fire = () => { if (!fired) { fired = true; cb() } }
+  setTimeout(() => {
+    hinted.finally(fire)
+    setTimeout(fire, HINT_WAIT_CAP_MS)
+  }, 3000)
 }
 
 const ClientAuthModal: React.FC = () => {
@@ -105,7 +130,7 @@ const ClientAuthModal: React.FC = () => {
         // the store and clears state, so capture it for the delayed call.
         const cb = useClientAuthStore.getState().onSuccess
         useClientAuthStore.setState({ isOpen: false, tokenId: undefined, onSuccess: undefined, onCancel: undefined })
-        if (cb) setTimeout(() => { hinted.finally(cb) }, 3000)
+        if (cb) retryAfterHint(hinted, cb)
       } catch (err: any) {
         if (err?.name === 'UserRejectedRequestError' || err?.code === 4001) {
           setError(t('client_auth.error.tx_rejected'))
@@ -159,7 +184,7 @@ const ClientAuthModal: React.FC = () => {
 
       const cb = useClientAuthStore.getState().onSuccess
       useClientAuthStore.setState({ isOpen: false, tokenId: undefined, onSuccess: undefined, onCancel: undefined })
-      if (cb) setTimeout(() => { hinted.finally(cb) }, 3000)
+      if (cb) retryAfterHint(hinted, cb)
     } catch (err: any) {
       const raw = (err?.message || '').replace(/^API\s+\d+:\s*/i, '')
       if (/NotAllowed|abort|cancel|denied|rejected/i.test(raw)) setError(t('client_auth.error.tx_rejected'))

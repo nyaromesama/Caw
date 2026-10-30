@@ -22,6 +22,7 @@ const writeContractAsync = vi.fn(async () => AUTH_HASH)
 const smartEoaExecute = vi.fn(async () => RELAY_HASH)
 let mockPopulation: 'A' | 'B' = 'A'
 let mockL2Balance = 10n ** 21n
+let mockStakeReadHangs = false
 
 vi.mock('wagmi', () => ({
   useWriteContract: () => ({ writeContractAsync }),
@@ -34,7 +35,8 @@ vi.mock('wagmi', () => ({
 
 vi.mock('~/api/actions', () => ({
   CLIENT_ID: 1,
-  readOnChainStakeForHint: vi.fn(async () => mockL2Balance),
+  readOnChainStakeForHint: vi.fn(() =>
+    mockStakeReadHangs ? new Promise<bigint>(() => {}) : Promise.resolve(mockL2Balance)),
 }))
 
 vi.mock('~/api/client', () => ({
@@ -96,7 +98,7 @@ async function authenticateAndRetry(): Promise<string | null> {
   useClientAuthStore.getState().show(TOKEN_ID, onSuccess)
   render(<ClientAuthModal />)
   fireEvent.click(screen.getByText('client_auth.btn.activate'))
-  await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(1), { timeout: 5000 })
+  await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(1), { timeout: 6000 })
   return hintAtRetry ?? null
 }
 
@@ -107,6 +109,7 @@ describe('ClientAuthModal', () => {
     localStorage.clear()
     mockPopulation = 'A'
     mockL2Balance = 10n ** 21n
+    mockStakeReadHangs = false
     writeContractAsync.mockClear()
     smartEoaExecute.mockClear()
     useClientAuthStore.setState({ isOpen: false, tokenId: undefined, onSuccess: undefined, onCancel: undefined })
@@ -135,9 +138,31 @@ describe('ClientAuthModal', () => {
   })
 
   it('does not touch an existing hint', async () => {
-    const existing = JSON.stringify({ amount: '5', txHash: `0x${'ef'.repeat(32)}`, at: 1 })
+    const existing = JSON.stringify({ amount: '5', txHash: `0x${'ef'.repeat(32)}`, at: Date.now() })
     localStorage.setItem(HINT_KEY, existing)
     const hint = await authenticateAndRetry()
     expect(hint).toBe(existing)
   })
+
+  it('replaces an expired hint, which the submit paths would drop', async () => {
+    localStorage.setItem(HINT_KEY, JSON.stringify({
+      amount: '5', txHash: `0x${'ef'.repeat(32)}`, at: Date.now() - 31 * 60 * 1000,
+    }))
+    const hint = await authenticateAndRetry()
+    expect(JSON.parse(hint!).txHash).toBe(AUTH_HASH)
+  })
+
+  it('replaces a hint that is not a valid tx hash', async () => {
+    localStorage.setItem(HINT_KEY, JSON.stringify({ txHash: '0x1234', at: Date.now() }))
+    const hint = await authenticateAndRetry()
+    expect(JSON.parse(hint!).txHash).toBe(AUTH_HASH)
+  })
+
+  it('still retries, without a hint, when the L2 balance read never answers', async () => {
+    mockStakeReadHangs = true
+    const started = Date.now()
+    const hint = await authenticateAndRetry()
+    expect(hint).toBeNull()
+    expect(Date.now() - started).toBeLessThan(5800)
+  }, 10000)
 })
