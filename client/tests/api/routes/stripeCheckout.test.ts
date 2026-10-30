@@ -7,7 +7,8 @@
  *    with 400. express.raw() now comes before the JSON parsers.
  * 2. The webhook mints through SponsorService.sponsorCardMint, which doesn't
  *    exist, so create-checkout now answers 503 until it does instead of
- *    sending the user to pay.
+ *    sending the user to pay. It also answers 503 without
+ *    STRIPE_WEBHOOK_SECRET, which the webhook needs to accept any event.
  *
  * server.ts can't be loaded here (it imports every router), so its parser order
  * is checked on the source, and the app below mounts the parsers in that order.
@@ -126,7 +127,7 @@ describe('stripe card checkout', () => {
     })
   })
 
-  describe('create-checkout while sponsorCardMint is missing', () => {
+  describe('create-checkout while the webhook cannot mint', () => {
     // Every request here carries an invalid username, so a route without the
     // gate stops at the zod check (400) and none of these ever calls Stripe.
     const invalidBody = {
@@ -152,6 +153,17 @@ describe('stripe card checkout', () => {
       const res = await request(app).post('/api/stripe/create-checkout').send(invalidBody)
       expect(res.status).to.equal(400)
       expect(res.body.error).to.equal('Invalid request')
+    })
+
+    it('answers 503 when STRIPE_WEBHOOK_SECRET is not set, even with sponsorCardMint', async () => {
+      sponsor = { sponsorCardMint: async () => ({}) }
+      delete process.env.STRIPE_WEBHOOK_SECRET
+      try {
+        const res = await request(app).post('/api/stripe/create-checkout').send(invalidBody)
+        expect(res.status).to.equal(503)
+      } finally {
+        process.env.STRIPE_WEBHOOK_SECRET = SECRET
+      }
     })
   })
 })

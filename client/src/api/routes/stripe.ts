@@ -14,8 +14,9 @@
  *      and records the purchase in StripePurchase.
  *
  * Gate: both endpoints return 503 when STRIPE_SECRET_KEY is not set.
- * create-checkout also returns 503 until SponsorService.sponsorCardMint exists,
- * so no card is charged for a mint the webhook can't perform.
+ * create-checkout also returns 503 when STRIPE_WEBHOOK_SECRET is not set, and
+ * until SponsorService.sponsorCardMint exists, so no card is charged for a mint
+ * the webhook can't perform.
  *
  * Raw body: the webhook handler must receive the raw (pre-parsed) request body
  * so Stripe can verify the signature. server.ts mounts express.raw() for this
@@ -99,6 +100,12 @@ const router = Router()
 router.post('/create-checkout', async (req: Request, res: Response) => {
   const stripe = getStripeClient()
   if (!stripe) {
+    return res.status(503).json({ error: 'Card checkout is not configured on this instance.' })
+  }
+
+  // Without its signing secret the webhook answers 503 to every event, so a
+  // paid session would never mint.
+  if (!process.env.STRIPE_WEBHOOK_SECRET) {
     return res.status(503).json({ error: 'Card checkout is not configured on this instance.' })
   }
 
