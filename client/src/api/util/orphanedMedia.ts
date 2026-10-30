@@ -186,6 +186,21 @@ export async function isStillReferenced(kind: MediaKind, filename: string): Prom
 }
 
 /**
+ * Remove one mark without letting a Redis error end the sweep: the keys after
+ * it still get processed, and the mark stays for the next sweep. Returns false
+ * when the ZREM failed.
+ */
+async function dropMark(fullKey: string): Promise<boolean> {
+  try {
+    await redis.zrem(ZSET_KEY, fullKey)
+    return true
+  } catch (e: any) {
+    console.warn(`[orphanedMedia] could not drop mark ${fullKey}:`, e?.message || e)
+    return false
+  }
+}
+
+/**
  * One-shot sweep: delete every key that's past its delete-at timestamp.
  * Returns counts for telemetry. Designed to be called from a periodic
  * job (DataCleaner) — safe to call concurrently because ZREM is atomic.
@@ -208,7 +223,7 @@ export async function sweep(opts: { dryRun?: boolean } = {}): Promise<{ deleted:
     if (!m) {
       console.warn('[orphanedMedia] could not parse key:', fullKey)
       // Drop the unparseable entry so it doesn't block subsequent sweeps.
-      await redis.zrem(ZSET_KEY, fullKey)
+      if (!(await dropMark(fullKey))) { failed++; continue }
       skipped++
       continue
     }
@@ -226,7 +241,7 @@ export async function sweep(opts: { dryRun?: boolean } = {}): Promise<{ deleted:
       continue
     }
     if (referenced) {
-      if (!opts.dryRun) await redis.zrem(ZSET_KEY, fullKey)
+      if (!opts.dryRun && !(await dropMark(fullKey))) { failed++; continue }
       kept++
       continue
     }

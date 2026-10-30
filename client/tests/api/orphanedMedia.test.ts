@@ -13,6 +13,9 @@
  * uploads next to a feed image stayed public forever, and avatar variants were
  * always marked as .webp even for a .jpg/.png/.gif base.
  *
+ * A Redis error while dropping one mark must not end the sweep: the keys
+ * after it are still processed, and the mark stays for the next sweep.
+ *
  * ioredis, mediaStorage and prisma are put in require.cache before
  * orphanedMedia.ts loads, so nothing connects to Redis, a database or storage.
  */
@@ -23,6 +26,7 @@ import { expect } from 'chai'
 // ─── In-memory stand-ins ────────────────────────────────────────────────────
 
 const zset = new Map<string, number>()
+let zremFailsFor: string | null = null
 class FakeRedis {
   status = 'ready'
   on() { return this }
@@ -31,7 +35,10 @@ class FakeRedis {
     return [...zset.entries()].filter(([, s]) => s >= min && s <= max)
       .sort((a, b) => a[1] - b[1]).map(([m]) => m).slice(off, off + n)
   }
-  async zrem(_k: string, member: string) { return zset.delete(member) ? 1 : 0 }
+  async zrem(_k: string, member: string) {
+    if (member === zremFailsFor) throw new Error('redis zrem failed')
+    return zset.delete(member) ? 1 : 0
+  }
   async zcard() { return zset.size }
 }
 
@@ -125,6 +132,7 @@ describe('orphan media GC', () => {
     deleted.length = 0
     for (const k of Object.keys(db)) delete db[k]
     dbDown = false
+    zremFailsFor = null
   })
 
   describe('sweep keeps files that are still referenced', () => {
@@ -191,6 +199,34 @@ describe('orphan media GC', () => {
       await om.sweep()
       expect(deleted).to.deep.equal([])
       expect(zset.size).to.equal(1)
+    })
+  })
+
+  describe('a failed ZREM does not stop the sweep', () => {
+    const KEPT = 'node.example/images/a1b2c3d4.webp'
+    const LOOSE = 'https://node.example/uploads/images/b2c3d4e5.webp'
+
+    it('a kept file whose mark cannot be dropped: the next key is still processed', async () => {
+      db.caw = [{ id: 1, status: 'SUCCESS', imageData: imageData(ALICE_IMG), content: '' }]
+      await om.markOrphan(ALICE_IMG)
+      await om.markOrphan(LOOSE)
+      zset.set(KEPT, zset.get(KEPT)! - 1) // the failing key comes first
+      zremFailsFor = KEPT
+      pastGrace()
+      const r = await om.sweep()
+      expect(deleted).to.deep.equal(['images/b2c3d4e5.webp'])
+      expect(r).to.include({ deleted: 1, failed: 1, kept: 0 })
+      expect([...zset.keys()], 'mark left for the next sweep').to.deep.equal([KEPT])
+    })
+
+    it('an unparseable key whose mark cannot be dropped: the next key is still processed', async () => {
+      zset.set('not-a-media-key', 0)
+      zremFailsFor = 'not-a-media-key'
+      await om.markOrphan(LOOSE)
+      pastGrace()
+      const r = await om.sweep()
+      expect(deleted).to.deep.equal(['images/b2c3d4e5.webp'])
+      expect(r).to.include({ deleted: 1, failed: 1, skipped: 0 })
     })
   })
 
